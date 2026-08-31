@@ -342,6 +342,54 @@ jobs:
           head -n 60 "$EXEC" || true
           exit 15
 
+      # -------- Patch ExternalProject *--impl.cmake：execute_process(COMMAND) 里的 shell-only 命令走 bash -lc --------
+      # 症状（v12.4 新 job-logs 里所有 FAILED step 统一 pattern）：
+      #   CMake Error at xxx-stamp/xxx-postremovebuild-.cmake:49 (message):
+      #     Command failed: 1
+      #       'cmake.exe' '-Dmake=' '-Dconfig=' '-P' '.../xxx-postremovebuild--impl.cmake'
+      # 根因：
+      #   外层一切都正常：cmd.exe /C 能跑、cmake.exe（PE）能跑。
+      #   但 impl.cmake 里的 execute_process(COMMAND  <argv0>  ...) 会被 CMake 直接
+      #   通过 CreateProcess(argv[0]) 执行 —— 如果 argv[0] 是 bash builtin（cd/echo/…）
+      #   或 MSYS2/usr/bin 里的程序（make/rm/mv/pkg-config 在 usr/bin 是 MSYS 程序）
+      #   或 `cd dir && ./configure` / `CONF=1 make install` 这种需要 shell 解析的
+      #   组合命令，CreateProcess 就找不到对应的 Win32 PE，返回非 0。
+      #   CMake 把它统一包装成 Command failed: 1（不会打印 stderr 细节）。
+      # 修法：
+      #   用 patch_impl_cmakes.py 扫描 build/** 下所有 *--impl.cmake，
+      #   找到每个 execute_process(COMMAND argv0 …) 中 argv0 "看起来不能直接被
+      #   CreateProcess 跑" 的那些，把整条 COMMAND 重写为：
+      #       bash -lc "<argv0..argvN 用 bash-printf %q 语义安全拼合>"
+      #   这样 impl.cmake 里原先需要 MSYS2 shell 的所有 COMMAND 都会被通过 bash 执行，
+      #   而 cmake.exe / ninja.exe / .exe 绝对路径 这种 PE 命令保持原样不处理，
+      #   不会引入多余的 quoting regression。
+      - name: Patch all *--impl.cmake (shell-only execute_process → bash -lc)
+        run: |
+          set -e
+          SB="${GITHUB_WORKSPACE:-/c/trae}/mpv-winbuild"
+          PY=""
+          if command -v python3 >/dev/null 2>&1; then PY=python3
+          elif command -v python >/dev/null 2>&1; then PY=python
+          elif command -v py >/dev/null 2>&1; then PY=py
+          fi
+          if [ -z "$PY" ]; then
+            echo "!!! Python not on PATH for patch_impl_cmakes.py"
+            echo "PATH=$PATH"
+            exit 41
+          fi
+          echo "using PY=$PY"
+          SCRIPT="${GITHUB_WORKSPACE:-/c/trae}/.github/workflows/patch_impl_cmakes.py"
+          ls -la "$SCRIPT"
+          "$PY" "$SCRIPT" "$SB/build"
+          # Diagnostic: dump the libsodium-download--impl.cmake if present — it was
+          # one of the v12.4-failing scripts, so we can confirm patching landed.
+          echo "---- sample: find any postremovebuild--impl.cmake, first 30 lines ----"
+          SAMPLE="$(find "$SB/build" -name '*postremovebuild--impl.cmake' -print -quit || true)"
+          if [ -n "$SAMPLE" ]; then
+            echo "sample file = $SAMPLE"
+            head -n 30 "$SAMPLE" || true
+          fi
+
       # -------- 跑 ninja。预计 2-4 小时。 --------
       - name: Build (ninja superbuild)
         run: |

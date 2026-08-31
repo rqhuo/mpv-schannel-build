@@ -217,6 +217,122 @@ def patch_ffmpeg(text: str) -> str:
     return out
 
 
+# List of ExternalProject step COMMANDs that (in shinchiro upstream impl.cmake)
+# run shell-compound statements / MSYS2-only tools / assignments via `cd ... &&`
+# or `VAR=value program`.  These commands expect the *invoking* process to be a
+# bash-compatible shell; when CMake's execute_process(COMMAND ...) runs them via
+# Windows CreateProcess they become "Command failed: 1" because the first argv
+# token (cd / CONF=1 / make / rm / mv) is not a Win32 PE image.
+#
+# Fix (v12.4): for each ExternalProject_Add() call we find, replace the empty
+# (implicit-default) step command for these known steps with a no-op "" **on
+# the CMake definition side**, BEFORE CMake generates the --impl.cmake files.
+# This way ExternalProject never emits an impl.cmake execute_process(COMMAND)
+# for them at all, so execute_process(COMMAND make clean / rm -rf) is gone.
+EP_STEP_COMMANDS_TO_NOOP = (
+    # CMake ExternalProject standard step names.  Any of these that are *not*
+    # explicitly set in packages/*.cmake will fall through to a default action,
+    # and the defaults (UPDATE_DISCONNECTED 1 → git, REMOVE build dir via shell,
+    # etc.) are the ones that hit shell-only commands.
+    #
+    # We intentionally skip steps we *need* (CONFIGURE / BUILD / INSTALL / TEST
+    # / TEST_BEFORE_INSTALL) — those are set explicitly by superbuild and run
+    # through the `build/exec` launcher, which our PE wrapper already fixes.
+    "DOWNLOAD_COMMAND",
+    "UPDATE_COMMAND",
+    "PATCH_COMMAND",
+    "CONFIGURE_COMMAND",   # keep but will only override *empty* ones → no-op
+    "BUILD_COMMAND",       # ditto
+    "INSTALL_COMMAND",     # ditto
+    "TEST_COMMAND",
+    "TEST_BEFORE_INSTALL_COMMAND",
+    # Non-standard step names sometimes used by shinchiro.  Force them to
+    # empty by keyword match later — we don't need them when using
+    # SINGLE_SOURCE_LOCATION.
+)
+
+
+def _is_explicitly_set_elsewhere(step_cmd: str, ep_body: str) -> bool:
+    """Return True if a command like `DOWNLOAD_COMMAND` is already set in the
+    ExternalProject body (even if it's empty string) — so we don't double-set.
+
+    Detection: whole-word match of step_cmd, not inside a comment, followed
+    by whitespace/quote/newline (we don't inspect the value here).
+    """
+    return bool(re.search(rf"(?m)^\s*{re.escape(step_cmd)}\b", ep_body))
+
+
+def force_ep_noop_steps(packages_dir: pathlib.Path) -> int:
+    """Find every `ExternalProject_Add(` block in every `*.cmake` under
+    packages_dir/ — inside each block, for every step in EP_STEP_COMMANDS_TO_NOOP
+    that is NOT already set explicitly, append a `STEP_COMMAND ""` line right
+    before the closing `)`.  By overwriting the step defaults this way, the
+    generated `<step>--impl.cmake` file never contains a shell-only execute_process.
+
+    Returns number of files changed.
+    """
+    STEPS = (
+        "DOWNLOAD_COMMAND",
+        "UPDATE_COMMAND",
+        "PATCH_COMMAND",
+        "TEST_COMMAND",
+        "TEST_BEFORE_INSTALL_COMMAND",
+    )
+    changed = 0
+    for f in sorted(packages_dir.glob("*.cmake")):
+        text = read(f)
+        if "ExternalProject_Add" not in text:
+            continue
+        original = text
+
+        def _patch_ep(match):
+            head = match.group(1)          # line `ExternalProject_Add(name\n` or `(name args\n`
+            body = match.group(2)          # everything up to (but not including) closing ')'
+            tail_paren = match.group(3)    # the closing paren itself + trailing newline
+            added_lines = []
+            indent = "    "
+            # Derive indent from the first non-empty body line if possible
+            for line in body.splitlines():
+                stripped = line.lstrip()
+                if stripped:
+                    indent = line[:len(line) - len(stripped)]
+                    break
+            for step in STEPS:
+                if _is_explicitly_set_elsewhere(step, body):
+                    # Already explicit (even `""`) → don't override.  But if the
+                    # caller wrote UPDATE_COMMAND with no value after it (not
+                    # empty string, just missing), we still want it handled by
+                    # regex above.  Explicit empty strings `""` are respected.
+                    continue
+                added_lines.append(f"{indent}{step} \"\"")
+            if not added_lines:
+                return head + body + tail_paren
+            injection = "\n".join(added_lines) + "\n"
+            # Insert right before closing ')'
+            return head + body.rstrip("\n") + "\n" + injection + "\n" + tail_paren
+
+        # Match ExternalProject_Add(...name\n...\n)  —  balanced parens inside
+        # are rare in these EP files, so a non-greedy `(?s).*?` stopping at a
+        # ^\s*\) line is accurate enough for the upstream format.
+        #
+        # Pattern:  ExternalProject_Add ( <ws>* <name> \n
+        #           (then anything until a line that is just whitespace + ')'
+        #            or a line that ends with ')' and that ')' is the only
+        #            non-whitespace char on it)
+        text2 = re.sub(
+            r"(?ms)(^\s*ExternalProject_Add\s*\([^\n]*\n)"
+            r"(.*?)"
+            r"(^\s*\)\s*\n)",
+            _patch_ep,
+            text,
+        )
+        if text2 != original:
+            write(f, text2)
+            print(f"   force-ep-noop: {f.as_posix()}")
+            changed += 1
+    return changed
+
+
 FF_MARK  = "# --- CI_FF_DISABLE_OPENSSL_INJECTED_v122 ---"
 MPV_MARK = "# --- CI_MPV_SCHANNEL_INJECTED_v122 ---"
 
