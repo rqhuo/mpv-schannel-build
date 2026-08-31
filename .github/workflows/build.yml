@@ -1,4 +1,4 @@
-name: build-libmpv2-i686-schannel
+name: build-libmpv2-i686-schannel-superbuild
 
 on:
   push:
@@ -8,19 +8,23 @@ on:
 
 jobs:
   build:
-    name: libmpv-2.dll i686 (no-openssl / schannel)
+    name: libmpv-2.dll i686 (shinchiro superbuild, no openssl, schannel)
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 360
 
     defaults:
       run:
         shell: msys2 {0}
 
     steps:
-      - name: Checkout (empty ok; mpv fetched separately)
+      - name: Checkout (empty ok; superbuild fetched separately)
         uses: actions/checkout@v4
 
-      - name: Setup MSYS2 MINGW32 (current DB, no archive fallback)
+      # -------- 只装 pacman 里能装的"小型工具"：gcc/cmake/meson/ninja/nasm/yasm/python/autotools  --------
+      # 前 11 次日志证明这些包名从来没 target-not-found 过；
+      # 多媒体库（ffmpeg/libbluray/libdvdnav 等）全部由 superbuild 从源码编，不再依赖 pacman 多媒体库。
+
+      - name: Setup MSYS2 MINGW32 (tools only)
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW32
@@ -28,231 +32,243 @@ jobs:
           install: >-
             base-devel
             git
+            mercurial
+            cvs
+            wget
             yasm
             nasm
             mingw-w64-i686-toolchain
+            mingw-w64-i686-cc
+            mingw-w64-i686-cmake
             mingw-w64-i686-meson
             mingw-w64-i686-ninja
             mingw-w64-i686-pkg-config
-            mingw-w64-i686-cmake
             mingw-w64-i686-nasm
             mingw-w64-i686-python
+            mingw-w64-i686-autotools
 
-      - name: Overwrite mirrorlist (mingw32 → OFFICIAL only; others CN+official 3-tier)
+      - name: Mirrorlist fix (correct repo paths; official first for reliability)
         run: |
           set -e
-          # 关键：MSYS2 镜像路径结构是 /mingw/$repo/  （mingw32/mingw64/ucrt64/clang64/clangarm64）
-          #                    以及 /msys/$arch/    （x86_64 / i686）
-          # 之前写成 /mingw/i686 是错路径！CN 镜像在错路径下会给出残缺 DB，导致 ffmpeg/libbluray 等大包"target not found"。
-
-          # mingw32 (i686): 官方镜像优先（DB 最完整，含多年未更的 ffmpeg/libbluray 等大包），
-          # CN 镜像用正确路径 /mingw/mingw32 作为兜底备用（/mingw/i686 是错路径！）
           cat > /etc/pacman.d/mirrorlist.mingw32 <<'EOF'
           Server = https://mirror.msys2.org/mingw/mingw32
           Server = https://mirrors.tuna.tsinghua.edu.cn/msys2/mingw/mingw32
           Server = https://mirrors.ustc.edu.cn/msys2/mingw/mingw32
           EOF
-
-          # x86_64 系列保留 CN + 官方回退
           cat > /etc/pacman.d/mirrorlist.mingw64 <<'EOF'
+          Server = https://mirror.msys2.org/mingw/mingw64
           Server = https://mirrors.tuna.tsinghua.edu.cn/msys2/mingw/mingw64
           Server = https://mirrors.ustc.edu.cn/msys2/mingw/mingw64
-          Server = https://mirror.msys2.org/mingw/mingw64
           EOF
           cat > /etc/pacman.d/mirrorlist.ucrt64 <<'EOF'
+          Server = https://mirror.msys2.org/mingw/ucrt64
           Server = https://mirrors.tuna.tsinghua.edu.cn/msys2/mingw/ucrt64
           Server = https://mirrors.ustc.edu.cn/msys2/mingw/ucrt64
-          Server = https://mirror.msys2.org/mingw/ucrt64
           EOF
           cat > /etc/pacman.d/mirrorlist.clang64 <<'EOF'
+          Server = https://mirror.msys2.org/mingw/clang64
           Server = https://mirrors.tuna.tsinghua.edu.cn/msys2/mingw/clang64
           Server = https://mirrors.ustc.edu.cn/msys2/mingw/clang64
-          Server = https://mirror.msys2.org/mingw/clang64
           EOF
           cat > /etc/pacman.d/mirrorlist.clangarm64 <<'EOF'
+          Server = https://mirror.msys2.org/mingw/clangarm64
           Server = https://mirrors.tuna.tsinghua.edu.cn/msys2/mingw/clangarm64
           Server = https://mirrors.ustc.edu.cn/msys2/mingw/clangarm64
-          Server = https://mirror.msys2.org/mingw/clangarm64
           EOF
-
-          # msys 核心仓库路径是 /msys/$arch
           cat > /etc/pacman.d/mirrorlist.msys <<'EOF'
+          Server = https://mirror.msys2.org/msys/$arch
           Server = https://mirrors.tuna.tsinghua.edu.cn/msys2/msys/$arch
           Server = https://mirrors.ustc.edu.cn/msys2/msys/$arch
-          Server = https://mirror.msys2.org/msys/$arch
           EOF
-
-          # 清掉 DB 缓存 + 强制重拉所有数据库（确保 mingw32.db 是官方完整版本）
           pacman -Scc --noconfirm || true
           pacman -Syy --noconfirm
           pacman -Suu --noconfirm || true
 
-      - name: Diagnostic - confirm mingw32 DB has ffmpeg/libbluray/dvdnav entries
-        run: |
-          set +e
-          echo "===== MSYSTEM / MINGW_PACKAGE_PREFIX ====="
-          echo "MSYSTEM=${MSYSTEM}"
-          echo "MINGW_PACKAGE_PREFIX=${MINGW_PACKAGE_PREFIX}"
-          echo "===== pacman -Ss (核心包可见性) ====="
-          for p in ffmpeg libbluray libdvdnav libdvdread libass freetype harfbuzz \
-                   fribidi uchardet rubberband libsamplerate soxr openal mpg123 \
-                   libvorbis libogg opus opusfile flac wavpack libplacebo libvpx \
-                   zimg luajit libarchive lcms2 libjpeg-turbo libpng dav1d x264 \
-                   shaderc spirv-cross vulkan-loader libvpl sdl2; do
-            out="$(pacman -Ss "^${MINGW_PACKAGE_PREFIX}-${p}$" 2>&1)"
-            if [ -n "$out" ]; then
-              echo "[FOUND] ${MINGW_PACKAGE_PREFIX}-${p}"
-              echo "        ${out}"
-            else
-              echo "[MISSING] ${MINGW_PACKAGE_PREFIX}-${p}（安装时会跳过或报错）"
-            fi
-          done
-          true
+      # -------- 取 shinchiro/mpv-winbuild-cmake 源码 --------
+      # 这个 superbuild 所有多媒体依赖都用 ExternalProject 从源码编：
+      # ffmpeg / libbluray / libdvdnav / libass / luajit / freetype / harfbuzz /
+      # fribidi / uchardet / rubberband / libplacebo / shaderc / spirv-cross / ...
+      # —— 一个 pacman 多媒体包都不用装，完美绕开 i686 "target not found" 泥潭。
 
-      - name: Install MANDATORY mingw32 libs (fail hard if missing)
-        run: |
-          set -e
-          # 核心依赖：缺了 mpv 就编不出来，或者 BD/DVD 就播不了。必须全部成功。
-          pacman -S --needed --noconfirm --ask=20 \
-            mingw-w64-i686-ffmpeg \
-            mingw-w64-i686-libbluray \
-            mingw-w64-i686-libdvdnav \
-            mingw-w64-i686-libdvdread \
-            mingw-w64-i686-libarchive \
-            mingw-w64-i686-libjpeg-turbo \
-            mingw-w64-i686-libpng \
-            mingw-w64-i686-lcms2 \
-            mingw-w64-i686-libass \
-            mingw-w64-i686-freetype \
-            mingw-w64-i686-harfbuzz \
-            mingw-w64-i686-fribidi \
-            mingw-w64-i686-uchardet \
-            mingw-w64-i686-rubberband \
-            mingw-w64-i686-libsamplerate \
-            mingw-w64-i686-soxr \
-            mingw-w64-i686-openal \
-            mingw-w64-i686-mpg123 \
-            mingw-w64-i686-libvorbis \
-            mingw-w64-i686-libogg \
-            mingw-w64-i686-opusfile \
-            mingw-w64-i686-opus \
-            mingw-w64-i686-flac \
-            mingw-w64-i686-wavpack \
-            mingw-w64-i686-libplacebo \
-            mingw-w64-i686-libvpx \
-            mingw-w64-i686-zimg \
-            mingw-w64-i686-luajit \
-            mingw-w64-i686-zlib \
-            mingw-w64-i686-bzip2 \
-            mingw-w64-i686-zstd \
-            mingw-w64-i686-lz4 \
-            mingw-w64-i686-libiconv
-          pkg-config --modversion libavcodec libbluray dvdnav luajit libplacebo
-
-      - name: Install OPTIONAL mingw32 libs (skip missing; meson will auto-disable)
-        run: |
-          # 这些库在 i686 上经常被砍掉。单个安装，装不上就跳过，meson 会自动 -Dxxx=disabled。
-          for pkg in \
-            mingw-w64-i686-shaderc \
-            mingw-w64-i686-spirv-cross \
-            mingw-w64-i686-vulkan-loader \
-            mingw-w64-i686-libvpl \
-            mingw-w64-i686-dav1d \
-            mingw-w64-i686-x264
-          do
-            echo "---- trying $pkg ----"
-            pacman -S --needed --noconfirm --ask=20 "$pkg" && echo "[OK] $pkg installed" || echo "[SKIP] $pkg not available"
-          done
-          true
-
-      - name: Clone mpv v0.41.0
+      - name: Clone shinchiro mpv-winbuild-cmake (pin recent commit; master can move)
         run: |
           set -e
           cd "${GITHUB_WORKSPACE:-/c/trae}"
-          rm -rf mpv
-          git clone --branch v0.41.0 --depth 1 --recurse-submodules \
-            https://github.com/mpv-player/mpv.git mpv
-          cd mpv
-          git rev-parse --short HEAD
+          rm -rf mpv-winbuild
+          git clone --depth 50 --recurse-submodules \
+            https://github.com/shinchiro/mpv-winbuild-cmake.git mpv-winbuild
+          cd mpv-winbuild
+          echo "SUPERBUILD HEAD = $(git rev-parse --short HEAD)"
+          ls cmake/
 
-      - name: meson setup (libmpv only, no openssl, schannel tls)
+      # -------- 注入 no-OpenSSL + 优先 Schannel --------
+      #
+      # 策略 = "双保险"：
+      #  1) 尝试往 superbuild 顶层 CMake 缓存变量里塞常见的 extra-options 名字
+      #     （不同分支/版本命名不一样：FFMPEG_EXTRA_OPTIONS / MPV_EXTRA_OPTIONS /
+      #      FFMPEG_ADDITIONAL_CONFIGURE_FLAGS / MPV_ADDITIONAL_MESON_FLAGS ...）
+      #  2) 用 grep+sed 在 cmake/*.cmake 里做"硬注入"：
+      #     —— 凡是 ffmpeg 的 CONFIGURE_COMMAND / 构建参数数组，强制追加
+      #        --disable-openssl --enable-schannel
+      #     —— 凡是 mpv 的 meson setup/option 数组，强制追加
+      #        -Dopenssl=disabled -Dtls-backend=schannel
+
+      - name: Inject no-openssl + schannel options into superbuild scripts (hard patch)
         run: |
           set -e
-          cd "${GITHUB_WORKSPACE:-/c/trae}/mpv"
+          SB="${GITHUB_WORKSPACE:-/c/trae}/mpv-winbuild"
+          cd "$SB"
 
-          # 只对"必须满足的约束"写死 =enabled / =disabled；其它功能全用 =auto，
-          # 这样 i686 镜像里如果少了 shaderc/vulkan/x264，meson 会自动 disabled，不挂构建。
-          meson setup build \
-            --buildtype=release \
-            --default-library=shared \
-            --prefix="${MINGW_PREFIX:-/mingw32}" \
-            --wrap-mode=nodownload \
-            -Dlibmpv=true \
-            -Dcplayer=false \
-            -Dclient-api=enabled \
-            -Diconv=enabled \
-            -Dlua=luajit \
-            -Djavascript=disabled \
-            -Dopenssl=disabled \
-            -Dtls-backend=schannel \
-            -Ddvdnav=enabled \
-            -Dbluray=enabled \
-            -Dlibarchive=auto \
-            -Dlcms2=auto \
-            -Dlibjpeg=auto \
-            -Duchardet=auto \
-            -Drubberband=auto \
-            -Dlibplacebo=auto \
-            -Dshaderc=auto \
-            -Dspirv-cross=auto \
-            -Dvulkan=auto \
-            -Dlibvpl=auto \
-            -Dopenal=auto \
-            -Dsdl2=disabled \
-            -Dgl=auto \
-            -Degl=auto \
-            -Dwayland=disabled \
-            -Dx11=disabled \
-            -Dd3d11=auto \
-            -Ddxvahd=auto \
-            -Dwasapi=auto \
-            -Dwinmm=auto
-          # Summary for debug
-          meson configure build | sed -n '1,200p'
+          echo "==== files in cmake/ mentioning ffmpeg or mpv ===="
+          ls cmake/ || true
+          grep -rIlE "ffmpeg|FFmpeg|libmpv|MPV|meson.*setup" cmake/ CMakeLists.txt 2>/dev/null || true
 
-      - name: Compile
+          echo "==== patch 1: ffmpeg: append --disable-openssl --enable-schannel to CONFIGURE_COMMAND or ffmpeg_OPTIONS / _opts arrays ===="
+          # 找任何 cmake/*.cmake 里设置 ffmpeg configure 参数的列表/字符串；在紧挨着 CONFIGURE_COMMAND 结尾或 ")" 之前或
+          # 在 append list 之后追加 flag。为了兼容多种写法，直接做三处相互独立的替换：
+
+          # A: 在任何 ExternalProject_Add 内出现 ffmpeg 的 CONFIGURE_COMMAND 参数结尾（通常有个尾随 ")"）之前注入。
+          #    精确做法：对包含 ffmpeg 的 CONFIGURE_COMMAND（不分大小写）那一行之后注入 --disable-openssl --enable-schannel 字符串到参数列表末尾。
+          perl -i -0pe 's/(ExternalProject_Add\s*\(\s*ffmpeg\b.*?CONFIGURE_COMMAND\s+.*?)(\s+\)\s*)$/$1 --disable-openssl --enable-schannel --enable-gnutls=no $2/si' \
+            $(grep -rlE "ExternalProject_Add\s*\(\s*ffmpeg\b" cmake/ 2>/dev/null) CMakeLists.txt 2>/dev/null || true
+
+          # B: 如果 cmake 把参数放到 list(APPEND ffmpeg_CONFIGURE_ARGS ...) 这种数组里：在文件末尾加一句独立的 list(APPEND)。
+          for f in $(grep -rlE "ffmpeg.*CONFIGURE|FFMPEG.*CONFIGURE|ffmpeg_CONFIGURE|ffmpeg.*options|ffmpeg.*args" cmake/ CMakeLists.txt 2>/dev/null); do
+            echo "-- patching ffmpeg opts into: $f"
+            # 去重避免重复注入
+            if ! grep -q "DISABLE_OPENSSL_INJECTED" "$f"; then
+              cat >> "$f" <<'FFEOF'
+              # --- BEGIN: INJECTED by CI (disable openssl, use schannel on ffmpeg) [DISABLE_OPENSSL_INJECTED]
+              if(COMMAND list)
+                foreach(_v IN ITEMS FFMPEG_CONFIGURE_ARGS ffmpeg_CONFIGURE_ARGS ffmpeg_OPTIONS FFMPEG_OPTIONS FFMPEG_ADDITIONAL_CONFIGURE_FLAGS FFMPEG_EXTRA_OPTIONS)
+                  if(DEFINED ${_v})
+                    list(APPEND ${_v} "--disable-openssl" "--enable-schannel")
+                    set(${_v} "${${_v}}" CACHE INTERNAL "" FORCE)
+                  endif()
+                endforeach()
+              endif()
+              # --- END: INJECTED by CI
+          FFEOF
+            fi
+          done
+
+          echo "==== patch 2: mpv meson options: append -Dopenssl=disabled -Dtls-backend=schannel ===="
+          # 同上，分两条路径：直接改 ExternalProject_Add(mpv ...) 以及往 cmake 文件末尾追加 set/list append。
+          perl -i -0pe 's/(ExternalProject_Add\s*\(\s*mpv\b.*?)(CONFIGURE_COMMAND\s+.*?meson\s+setup\b.*?)(\s+\)\s*)$/$1$2 -Dopenssl=disabled -Dtls-backend=schannel $3/si' \
+            $(grep -rlE "ExternalProject_Add\s*\(\s*mpv\b" cmake/ 2>/dev/null) CMakeLists.txt 2>/dev/null || true
+
+          for f in $(grep -rlE "mpv.*meson|MPV.*MESON|mpv.*setup|libmpv|MPV_EXTRA|MPV_OPTION" cmake/ CMakeLists.txt 2>/dev/null); do
+            echo "-- patching mpv opts into: $f"
+            if ! grep -q "MPV_SCHANNEL_INJECTED" "$f"; then
+              cat >> "$f" <<'MVEOF'
+              # --- BEGIN: INJECTED by CI (no openssl, schannel tls for mpv) [MPV_SCHANNEL_INJECTED]
+              if(COMMAND list)
+                foreach(_v IN ITEMS
+                    MPV_MESON_OPTIONS    mpv_MESON_OPTIONS
+                    MPV_OPTIONS          mpv_OPTIONS
+                    MPV_EXTRA_OPTIONS    mpv_EXTRA_OPTIONS
+                    MPV_ADDITIONAL_MESON_FLAGS mpv_ADDITIONAL_MESON_FLAGS
+                    MPV_CONFIGURE_ARGS   mpv_CONFIGURE_ARGS)
+                  if(DEFINED ${_v})
+                    list(APPEND ${_v} "-Dopenssl=disabled" "-Dtls-backend=schannel")
+                    set(${_v} "${${_v}}" CACHE INTERNAL "" FORCE)
+                  endif()
+                endforeach()
+              endif()
+              # --- END: INJECTED by CI
+          MVEOF
+            fi
+          done
+
+          # C: 最后"兜底 grep 替换"：任何 cmake/ 目录下 .cmake 文件只要有 -Dlua= 这种 meson 参数出现就
+          #    在同一行后面硬塞 -Dopenssl=disabled -Dtls-backend=schannel；同时如果出现 "--enable-gnutls"
+          #    就替换成 "--disable-gnutls"（和前面的 --disable-openssl 双保险避免意外链接 TLS）。
+          find cmake/ CMakeLists.txt -type f \( -name '*.cmake' -o -name 'CMakeLists.txt' \) -print0 \
+            | xargs -0 sed -i \
+                -e 's/\(-Dlua=[A-Za-z0-9_-]*\)/\1 -Dopenssl=disabled -Dtls-backend=schannel/g' \
+                -e 's/--enable-openssl/--disable-openssl --enable-schannel/g' \
+                -e 's/--enable-gnutls/--disable-gnutls/g' \
+              || true
+
+          echo "==== summary of changes ===="
+          git --no-pager diff --stat || true
+          git --no-pager diff cmake/ CMakeLists.txt || true
+
+      # -------- CMake configure superbuild (i686) --------
+      - name: CMake configure (TARGET_ARCH = i686)
         run: |
           set -e
-          cd "${GITHUB_WORKSPACE:-/c/trae}/mpv"
-          meson compile -C build --verbose
-          ls -la build/*.dll build/*.exe build/libmpv* 2>/dev/null || true
-          ls -la build/subprojects/*/libmpv* 2>/dev/null || true
+          SB="${GITHUB_WORKSPACE:-/c/trae}/mpv-winbuild"
+          cd "$SB"
 
-      - name: Locate libmpv-2.dll
+          # TARGET_ARCH = i686  →  superbuild 自动切 MINGW32 工具链 + local32 输出目录
+          # 同时把常见缓存名都塞一遍 no-openssl/schannel 选项（Patch 步是"物理注入"，
+          # 这里再补一份，防不同版本 superbuild 结构差异）。
+          cmake -S . -B build -G Ninja \
+            -DTARGET_ARCH=i686 \
+            -DCMAKE_INSTALL_PREFIX="" \
+            -DALWAYS_REMOVE_BUILD_DIRS=ON \
+            -DFFMPEG_EXTRA_OPTIONS="--disable-openssl;--enable-schannel;--disable-gnutls" \
+            -DFFMPEG_ADDITIONAL_CONFIGURE_FLAGS="--disable-openssl;--enable-schannel;--disable-gnutls" \
+            -DMPV_EXTRA_OPTIONS="-Dopenssl=disabled;-Dtls-backend=schannel" \
+            -DMPV_EXTRA_MESON_OPTIONS="-Dopenssl=disabled;-Dtls-backend=schannel" \
+            -DMPV_ADDITIONAL_MESON_FLAGS="-Dopenssl=disabled;-Dtls-backend=schannel"
+          echo "---- cmake cache top-entries ----"
+          cmake -L -N build | head -n 80
+
+      # -------- 跑 ninja。预计 2-4 小时。 --------
+      - name: Build (ninja superbuild)
         run: |
           set -e
-          cd "${GITHUB_WORKSPACE:-/c/trae}/mpv"
-          DLL="$(find build -maxdepth 3 -type f \( -name 'libmpv-2.dll' -o -name 'mpv-2.dll' \) -print -quit)"
+          SB="${GITHUB_WORKSPACE:-/c/trae}/mpv-winbuild"
+          cd "$SB/build"
+          # -j3: 节省内存（Windows runner 是 4 vCPU，留一点给 OS）
+          cmake --build . -j3 -- -v -k0 2>&1 | tail -n 500
+
+      # -------- 找产物：libmpv-2.dll (i686 superbuild 默认装到 local32/bin) --------
+      - name: Locate libmpv-2.dll + dependencies
+        run: |
+          set -e
+          SB="${GITHUB_WORKSPACE:-/c/trae}/mpv-winbuild"
+          cd "$SB"
+          echo "==== tree of build/local* / build/mpv* ===="
+          find build/local* build/mpv* build/install* build/root* \
+               -maxdepth 5 -type f \( -name 'libmpv-2.dll' -o -name 'mpv-2.dll' -o -name 'mpv.exe' \) 2>/dev/null || true
+
+          DLL="$(find build -type f \( -name 'libmpv-2.dll' -o -name 'mpv-2.dll' \) -print -quit)"
           if [ -z "$DLL" ]; then
-            echo "!!! libmpv-2.dll NOT FOUND"
-            find build -maxdepth 4 -type f \( -name '*.dll' -o -name '*.exe' \)
+            echo "!!! libmpv-2.dll NOT FOUND; listing all .dll under build/"
+            find build -type f -name '*.dll' -o -name '*.exe' 2>/dev/null | head -n 200
             exit 21
           fi
           echo "FOUND_DLL=${DLL}"
-          mkdir -p "${GITHUB_WORKSPACE:-/c/trae}/artifact"
-          cp -f "$DLL" "${GITHUB_WORKSPACE:-/c/trae}/artifact/libmpv-2.dll"
-          # Also copy the import lib for users who want to link against it
-          IMP="$(find build -maxdepth 3 -type f \( -name 'libmpv.dll.a' -o -name 'libmpv.dll.a.dll.a' \) -print -quit || true)"
-          [ -n "$IMP" ] && cp -f "$IMP" "${GITHUB_WORKSPACE:-/c/trae}/artifact/libmpv.dll.a" || true
-          EXP_H="$(find . -maxdepth 3 -type f -name 'client.h' -path '*/mpv/*' -print -quit || true)"
-          [ -n "$EXP_H" ] && cp -f "$EXP_H" "${GITHUB_WORKSPACE:-/c/trae}/artifact/mpv_client.h" || true
-          ls -la "${GITHUB_WORKSPACE:-/c/trae}/artifact/"
-          file "${GITHUB_WORKSPACE:-/c/trae}/artifact/libmpv-2.dll" || true
+          ls -la "$DLL"
+          file "$DLL" || true
 
+          OUTDIR="${GITHUB_WORKSPACE:-/c/trae}/artifact"
+          mkdir -p "$OUTDIR"
+          cp -f "$DLL" "$OUTDIR/libmpv-2.dll"
+
+          # mpv superbuild 把 ffmpeg/bluray/dvdnav 等所有依赖都默认**静态**链接进了 libmpv-2.dll，
+          # 所以一般情况下 libmpv-2.dll 一个文件就够你在易语言里 LoadLibrary 用了。
+          # 这里也把同目录下的 mpv.exe / 导入库 / 头文件都拷上，留作以后调试：
+          BASEDIR="$(dirname "$DLL")"
+          [ -f "${BASEDIR}/mpv.exe"      ] && cp -f "${BASEDIR}/mpv.exe"         "$OUTDIR/" || true
+          [ -f "${BASEDIR}/libmpv.dll.a" ] && cp -f "${BASEDIR}/libmpv.dll.a"    "$OUTDIR/" || true
+          IMP="$(find build -type f -name 'libmpv.dll.a' -print -quit)"
+          [ -n "$IMP" ] && cp -f "$IMP" "$OUTDIR/libmpv.dll.a" || true
+          CLIENT_H="$(find build -type f -path '*/mpv/*/client.h' -print -quit)"
+          [ -z "$CLIENT_H" ] && CLIENT_H="$(find mpv source sources -type f -name 'client.h' -path '*/mpv/*' -print -quit 2>/dev/null || true)"
+          [ -n "$CLIENT_H" ] && cp -f "$CLIENT_H" "$OUTDIR/mpv_client.h" || true
+
+          echo "==== artifact dir ===="
+          ls -la "$OUTDIR/"
+
+      # -------- 上传 --------
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: libmpv-2-i686-schannel
+          name: libmpv-2-i686-schannel-superbuild
           path: ${{ github.workspace }}/artifact/*
           if-no-files-found: error
           compression-level: 6
