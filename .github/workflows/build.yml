@@ -1,98 +1,42 @@
 name: Build libmpv-2.dll (i686, SChannel-only, no OpenSSL)
 
 on:
-  workflow_dispatch:   # 允许你手动点"Run workflow"触发
+  workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [main]
 
 jobs:
   build:
     runs-on: windows-latest
-    defaults:
-      run:
-        shell: msys2 {0}
     steps:
-      - name: Checkout (placeholder, we don't need repo files)
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup MSYS2 MINGW32 toolchain
+      - name: Setup MSYS2 MINGW32
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW32
           update: true
-          install: >-
-            base-devel git
-            mingw-w64-i686-toolchain
-            mingw-w64-i686-meson
-            mingw-w64-i686-pkgconf
-            mingw-w64-i686-nasm
-            mingw-w64-i686-ffmpeg
-            mingw-w64-i686-libass
-            mingw-w64-i686-libjpeg-turbo
-            mingw-w64-i686-libbluray
-            mingw-w64-i686-libdvdnav
-            mingw-w64-i686-libdvdcss
-            mingw-w64-i686-shaderc
-            mingw-w64-i686-spirv-cross
-            mingw-w64-i686-lcms2
-            mingw-w64-i686-libarchive
-            mingw-w64-i686-mujs
-            mingw-w64-i686-vulkan-loader
-            mingw-w64-i686-angleproject-git
+          install: base-devel git mingw-w64-i686-toolchain mingw-w64-i686-meson mingw-w64-i686-pkgconf mingw-w64-i686-nasm mingw-w64-i686-ffmpeg mingw-w64-i686-libass mingw-w64-i686-libjpeg-turbo mingw-w64-i686-libbluray mingw-w64-i686-libdvdnav mingw-w64-i686-libdvdcss mingw-w64-i686-shaderc mingw-w64-i686-spirv-cross mingw-w64-i686-lcms2 mingw-w64-i686-libarchive mingw-w64-i686-mujs mingw-w64-i686-vulkan-loader mingw-w64-i686-angleproject-git
 
-      - name: Clone mpv source (stable tag)
-        run: |
-          git clone --depth 1 --branch v0.39.0 https://github.com/mpv-player/mpv.git ${{ github.workspace }}/mpv
+      - name: Clone mpv v0.39.0
+        shell: msys2 {0}
+        run: git clone --depth 1 --branch v0.39.0 https://github.com/mpv-player/mpv.git mpv
 
-      - name: Configure meson (KEY: OpenSSL disabled, SChannel forced, DVD/BD enabled)
-        run: |
-          cd ${{ github.workspace }}/mpv
-          meson setup build \
-            --buildtype=release \
-            --default-library=shared \
-            --prefix=/mingw32 \
-            -Dlibmpv=true \
-            -Dcplayer=false \
-            -Dtls-backend=schannel \
-            -Dopenssl=disabled \
-            -Diconv=enabled \
-            -Dwin32-internal-pthreads=true \
-            -Ddvdnav=enabled \
-            -Ddvdread=enabled \
-            -Dlibbluray=enabled \
-            -Dffmpeg=enabled \
-            -Dlibass=enabled \
-            -Dlua=disabled \
-            -Djavascript=disabled \
-            -Dvulkan=enabled \
-            -Degl-angle=enabled \
-            -Djpeg=enabled \
-            -Dlcms2=enabled \
-            -Dlibarchive=enabled
+      - name: Configure meson (no-OpenSSL, force SChannel, DVD/BD on)
+        shell: msys2 {0}
+        run: cd mpv && meson setup build --buildtype=release --default-library=shared --prefix=/mingw32 -Dlibmpv=true -Dcplayer=false -Dtls-backend=schannel -Dopenssl=disabled -Diconv=enabled -Dwin32-internal-pthreads=true -Ddvdnav=enabled -Ddvdread=enabled -Dlibbluray=enabled -Dffmpeg=enabled -Dlibass=enabled -Dlua=disabled -Djavascript=disabled -Dvulkan=enabled -Degl-angle=enabled -Djpeg=enabled -Dlcms2=enabled -Dlibarchive=enabled
 
       - name: Compile
-        run: |
-          cd ${{ github.workspace }}/mpv
-          meson compile -C build -j$NUMBER_OF_PROCESSORS
+        shell: msys2 {0}
+        run: cd mpv && meson compile -C build -j$NUMBER_OF_PROCESSORS
 
-      - name: Collect build artifacts (DLL + import lib + headers)
-        run: |
-          mkdir -p ${{ github.workspace }}/output/libmpv-schannel-i686/include
-          cp ${{ github.workspace }}/mpv/build/libmpv-2.dll ${{ github.workspace }}/output/libmpv-schannel-i686/
-          cp ${{ github.workspace }}/mpv/build/libmpv.dll.a ${{ github.workspace }}/output/libmpv-schannel-i686/
-          cp ${{ github.workspace }}/mpv/libmpv/client.h ${{ github.workspace }}/output/libmpv-schannel-i686/include/
-          cp ${{ github.workspace }}/mpv/libmpv/render.h ${{ github.workspace }}/output/libmpv-schannel-i686/include/
-          cp ${{ github.workspace }}/mpv/libmpv/stream_cb.h ${{ github.workspace }}/output/libmpv-schannel-i686/include/
-          # 也把 MinGW 运行时依赖一起收进来，避免用户再自己找
-          for dll in /mingw32/bin/libwinpthread-1.dll \
-                     /mingw32/bin/libgcc_s_sjlj-1.dll ; do
-            cp "$dll" ${{ github.workspace }}/output/libmpv-schannel-i686/ || true
-          done
-          echo "Artifacts collected:"
-          ls -la ${{ github.workspace }}/output/libmpv-schannel-i686/
+      - name: Collect artifacts
+        shell: msys2 {0}
+        run: mkdir -p output/include && cp mpv/build/libmpv-2.dll output/ && cp mpv/build/libmpv.dll.a output/ && cp mpv/libmpv/client.h output/include/ && cp mpv/libmpv/render.h output/include/ && cp mpv/libmpv/stream_cb.h output/include/ && cp /mingw32/bin/libwinpthread-1.dll output/ 2>/dev/null || true && cp /mingw32/bin/libgcc_s_sjlj-1.dll output/ 2>/dev/null || true && ls -la output/
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: libmpv-schannel-i686
-          path: ${{ github.workspace }}/output/
+          path: output/
