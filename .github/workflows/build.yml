@@ -1,4 +1,4 @@
-name: Build libmpv-2.dll (i686, SChannel-only, no OpenSSL)
+name: Build libmpv-2.dll (i686, no-OpenSSL assertion)
 
 on:
   workflow_dispatch:
@@ -12,31 +12,177 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup MSYS2 MINGW32
+      - name: Install MSYS2 + refresh package DB
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW32
+          # KEY: 必须先 update 再 install。单纯 install 不会刷新 pacman 本地索引,target not found。
           update: true
-          install: base-devel git mingw-w64-i686-toolchain mingw-w64-i686-meson mingw-w64-i686-pkgconf mingw-w64-i686-nasm mingw-w64-i686-ffmpeg mingw-w64-i686-libass mingw-w64-i686-libjpeg-turbo mingw-w64-i686-libbluray mingw-w64-i686-libdvdnav mingw-w64-i686-libdvdcss mingw-w64-i686-shaderc mingw-w64-i686-spirv-cross mingw-w64-i686-lcms2 mingw-w64-i686-libarchive mingw-w64-i686-mujs mingw-w64-i686-vulkan-loader mingw-w64-i686-angleproject-git
+          pacboy: >
+            toolchain:p
+            meson:p
+            pkgconf:p
+            nasm:p
+            ffmpeg:p
+            libass:p
+            libjpeg-turbo:p
+            libbluray:p
+            libdvdnav:p
+            shaderc:p
+            spirv-cross:p
+            lcms2:p
+            libarchive:p
+            mujs:p
+            vulkan-loader:p
+            angle-library:p
+            libplacebo:p
+            vulkan-headers:p
+
+      - name: Install libdvdcss (not in pacboy default repos; add mingw64/mingw32 explicitly)
+        shell: msys2 {0}
+        run: |
+          set -e
+          echo "=== pacman -Ss libdvdcss (available packages) ==="
+          pacman -Ss libdvdcss || true
+          echo "=== Try installing explicit names ==="
+          pacman -S --noconfirm --needed \
+            mingw-w64-i686-libdvdcss \
+            mingw-w64-i686-libdvdread \
+            mingw-w64-i686-libdvdnav \
+            2>&1 | tail -n 40 || true
+          echo "=== Verify presence ==="
+          for pkg in libdvdcss libdvdread libdvdnav ffmpeg libbluray libass shaderc angle-library; do
+            printf "%-18s -> " "$pkg"
+            pacman -Qs "^mingw-w64-i686-${pkg}\$" | head -n 1 || echo "NOT FOUND"
+          done
+
+      - name: Diagnose: list all actually installed mingw packages
+        shell: msys2 {0}
+        run: |
+          set +e
+          echo "=== i686 packages count: $(pacman -Qsq mingw-w64-i686- | wc -l) ==="
+          echo "=== i686 packages list (names only) ==="
+          pacman -Qsq mingw-w64-i686-
+          echo "=== meson version ==="
+          meson --version
+          echo "=== pkg-config can find ffmpeg? ==="
+          pkg-config --exists libavcodec && echo "libavcodec YES: $(pkg-config --modversion libavcodec)" || echo "libavcodec NO"
+          pkg-config --exists libbluray && echo "libbluray YES" || echo "libbluray NO"
+          pkg-config --exists dvdnav && echo "dvdnav YES" || echo "dvdnav NO"
 
       - name: Clone mpv v0.39.0
         shell: msys2 {0}
-        run: git clone --depth 1 --branch v0.39.0 https://github.com/mpv-player/mpv.git mpv
+        run: |
+          set -e
+          rm -rf mpv
+          git clone --depth 1 --branch v0.39.0 https://github.com/mpv-player/mpv.git mpv
+          cd mpv
+          echo "=== meson_options.txt first 60 lines (for TRUE option name reference) ==="
+          head -n 60 meson_options.txt || true
+          echo "=== grep for tls/openssl/angle/pthread keys in meson_options.txt ==="
+          grep -Ei "option\s*\(\s*['\"](tls|openssl|angle|pthread|egl|win32)" meson_options.txt || true
 
-      - name: Configure meson (no-OpenSSL, force SChannel, DVD/BD on)
+      - name: Configure meson
         shell: msys2 {0}
-        run: cd mpv && meson setup build --buildtype=release --default-library=shared --prefix=/mingw32 -Dlibmpv=true -Dcplayer=false -Dtls-backend=schannel -Dopenssl=disabled -Diconv=enabled -Dwin32-internal-pthreads=true -Ddvdnav=enabled -Ddvdread=enabled -Dlibbluray=enabled -Dffmpeg=enabled -Dlibass=enabled -Dlua=disabled -Djavascript=disabled -Dvulkan=enabled -Degl-angle=enabled -Djpeg=enabled -Dlcms2=enabled -Dlibarchive=enabled
+        run: |
+          set -e
+          cd mpv
+          rm -rf build
+          set +e
+          meson setup build \
+            --buildtype=release \
+            --default-library=shared \
+            --prefix=/mingw32 \
+            -Dlibmpv=true \
+            -Dcplayer=false \
+            -Dtls-backend=schannel \
+            -Dopenssl=disabled \
+            -Diconv=enabled \
+            -Ddvdnav=enabled \
+            -Ddvdread=enabled \
+            -Dlibbluray=enabled \
+            -Dffmpeg=enabled \
+            -Dlibass=enabled \
+            -Dlua=disabled \
+            -Djavascript=disabled \
+            -Dvulkan=enabled \
+            -Degl=enabled \
+            -Dangle-libs=auto \
+            -Djpeg=enabled \
+            -Dlcms2=enabled \
+            -Dlibarchive=enabled \
+            -Dsdl2=disabled \
+            -Dlibplacebo=auto
+          rc=$?
+          set -e
+          if [ $rc -ne 0 ]; then
+            echo "=== meson setup FAILED. Dumping log ==="
+            if [ -f build/meson-logs/meson-log.txt ]; then
+              tail -n 120 build/meson-logs/meson-log.txt
+            else
+              echo "No build/meson-logs/meson-log.txt yet"
+            fi
+            echo "=== True options for this mpv version ==="
+            # Re-print the keys we really need
+            grep -E "option\s*\('\s*'" meson_options.txt | head -n 120 || true
+            exit $rc
+          fi
+          echo "=== meson configure summary ==="
+          meson configure build | head -n 80
 
       - name: Compile
         shell: msys2 {0}
-        run: cd mpv && meson compile -C build -j$NUMBER_OF_PROCESSORS
+        run: |
+          set -e
+          cd mpv
+          cores=$([ -n "$NUMBER_OF_PROCESSORS" ] && echo "$NUMBER_OF_PROCESSORS" || echo "2")
+          echo "=== Compile on $cores cores ==="
+          set +e
+          meson compile -C build -j$cores 2>&1 | tail -n 40
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ $rc -ne 0 ]; then
+            echo "=== Compile FAILED, verbose last 160 lines ==="
+            meson compile -C build --verbose 2>&1 | tail -n 160
+            exit $rc
+          fi
+          echo "=== Build outputs ==="
+          ls -la build/libmpv* build/mpv* 2>/dev/null || ls -la build/ | head -n 30
 
       - name: Collect artifacts
         shell: msys2 {0}
-        run: mkdir -p output/include && cp mpv/build/libmpv-2.dll output/ && cp mpv/build/libmpv.dll.a output/ && cp mpv/libmpv/client.h output/include/ && cp mpv/libmpv/render.h output/include/ && cp mpv/libmpv/stream_cb.h output/include/ && cp /mingw32/bin/libwinpthread-1.dll output/ 2>/dev/null || true && cp /mingw32/bin/libgcc_s_sjlj-1.dll output/ 2>/dev/null || true && ls -la output/
+        run: |
+          set -e
+          rm -rf output && mkdir -p output/include
+
+          if [ -f mpv/build/libmpv-2.dll ]; then
+            cp mpv/build/libmpv-2.dll output/
+            cp mpv/build/libmpv.dll.a output/ 2>/dev/null || true
+            cp mpv/libmpv/client.h   output/include/
+            cp mpv/libmpv/render.h   output/include/
+            cp mpv/libmpv/stream_cb.h output/include/
+
+            # 拉取所有运行时 DLL(ldd 列出的 mingw 非系统依赖)
+            cd output
+            if command -v ldd >/dev/null 2>&1; then
+              ldd libmpv-2.dll | grep -E 'mingw32|/mingw' | awk '{print $3}' | while read -r dll; do
+                [ -f "$dll" ] && cp "$dll" . || true
+              done
+            else
+              echo "ldd not available, skipping runtime DLL collection"
+            fi
+
+            echo "=== Final artifacts ==="
+            ls -la
+          else
+            echo "libmpv-2.dll NOT BUILT, listing build dir for diagnosis:"
+            ls -la mpv/build/
+            exit 2
+          fi
 
       - name: Upload artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: libmpv-schannel-i686
+          name: libmpv-i686-output
           path: output/
