@@ -228,9 +228,140 @@ def _tokenize_cmake_args(text: str, start: int):
         yield tok, i
 
 
-def patch_execute_process(text: str) -> str:
-    """Return text with every execute_process(COMMAND …) call that looks unsafe
-    rewritten through bash -lc."""
+def patch_execute_process(text: str, filename_for_context: str = "<unknown>") -> str:
+    """Return text with execute_process(COMMAND …) calls fixed.
+
+    Two strategies, applied in order.  Which one applies depends on BOTH the
+    command content AND the filename (passed via filename_for_context so we
+    can distinguish step types without re-parsing paths outside):
+
+      STRATEGY 1 (postremovebuild / removebuild impl scripts — HIGHEST priority).
+        Filenames like `*-postremovebuild--impl.cmake` or
+        `*-removebuild--impl.cmake` correspond to ExternalProject's internal
+        "clean up stale build tree BEFORE we configure this package" step.
+        In a brand-new CI build (empty build/) these steps are 100% no-ops by
+        definition — there simply is nothing to clean.  But upstream EP emits:
+            execute_process(COMMAND ${CMAKE_MAKE_PROGRAM} clean
+                            RESULT_VARIABLE  rc ...)
+        which with Ninja generator expands to `ninja clean`.  `ninja clean`
+        REQUIRES a build.ninja file in the working dir to know which rules
+        exist; at this point in the pipeline configure hasn't run yet, so the
+        build dir is empty and `ninja clean` exits with code 1.  Because
+        `ninja` is a Win32 PE name it was passing first_token_is_safe_pe() and
+        our patch was leaving it alone → exactly the Command failed: 1 we kept
+        seeing for hundreds of packages in every run.  Fix: for these two
+        step-types ONLY, replace the whole execute_process block with
+        `set(<rcvar> 0)` (keeping the actual variable name used), turning the
+        step into a guaranteed success while preserving any downstream checks.
+
+      STRATEGY 2 (everything else — fallback, unchanged from v12.5 logic).
+        Any COMMAND whose first token is not CreateProcess-safe (bash builtins,
+        VAR=value prefixes, compound tokens cd/&&/pipe, ./configure scripts)
+        gets re-emitted as `execute_process(COMMAND bash -lc "<recomposed>")`.
+        PE-safe commands are kept verbatim.
+    """
+    # ---- Strategy 1 shortcut: force success for removebuild/postremovebuild.
+    is_cleanup_script = False
+    base = (filename_for_context or "").lower().replace("\\", "/").split("/")[-1]
+    if base.endswith("--impl.cmake"):
+        stem = base[:-len("--impl.cmake")]
+        if stem.endswith("-postremovebuild") or stem.endswith("-removebuild"):
+            is_cleanup_script = True
+    if is_cleanup_script:
+        # Find every:
+        #   execute_process(
+        #     COMMAND ... ARGS ...
+        #     RESULT_VARIABLE <ident>
+        #     ... optional OUTPUT_VARIABLE / ERROR_VARIABLE / WORKING_DIRECTORY / etc
+        #   )
+        # and replace the whole block with:   set(<ident> 0)
+        #
+        # CMake names RESULT_VARIABLE differently across EP versions (rc,
+        # ret, ...), so we extract it verbatim from the input.
+        out_parts = []
+        i2 = 0
+        n2 = len(text)
+        pat = re.compile(r"execute_process\s*\(", re.IGNORECASE)
+        while i2 < n2:
+            m2 = pat.search(text, i2)
+            if not m2:
+                out_parts.append(text[i2:])
+                break
+            out_parts.append(text[i2:m2.start()])
+            # Find matching closing ')'.  EP impl.cmake execute_process() never
+            # has nested parens inside so a depth counter is enough.
+            j2 = m2.end()
+            depth = 1
+            rv_name = None
+            in_quote = False
+            while j2 < n2 and depth > 0:
+                ch2 = text[j2]
+                if ch2 == '"':
+                    # Find matching unescaped quote
+                    j2 += 1
+                    while j2 < n2:
+                        ccc = text[j2]
+                        if ccc == "\\" and j2 + 1 < n2:
+                            j2 += 2
+                            continue
+                        j2 += 1
+                        if ccc == '"':
+                            break
+                    continue
+                if ch2 == "(":
+                    depth += 1
+                    j2 += 1
+                    continue
+                if ch2 == ")":
+                    depth -= 1
+                    j2 += 1
+                    continue
+                if ch2.isspace():
+                    j2 += 1
+                    continue
+                # Read token to see if it's RESULT_VARIABLE
+                k2 = j2
+                while k2 < n2:
+                    c = text[k2]
+                    if c.isspace() or c in "()":
+                        break
+                    k2 += 1
+                word = text[j2:k2]
+                if rv_name is None and word == "RESULT_VARIABLE":
+                    # read the name after
+                    j3 = k2
+                    while j3 < n2 and text[j3].isspace():
+                        j3 += 1
+                    j3end = j3
+                    while j3end < n2:
+                        c = text[j3end]
+                        if c.isspace() or c in "()\"":
+                            break
+                        j3end += 1
+                    if j3end > j3:
+                        rv_name = text[j3:j3end]
+                j2 = k2
+            # Block spans text[m2.start() : j2].  Replace with set(rv_name, 0)
+            if rv_name:
+                indent = ""
+                # Derive indent from line-start position before the match.
+                line_start = text.rfind("\n", 0, m2.start())
+                line_start = 0 if line_start < 0 else line_start + 1
+                prefix_chunk = text[line_start:m2.start()]
+                stripped = prefix_chunk.lstrip()
+                indent = prefix_chunk[:len(prefix_chunk) - len(stripped)]
+                out_parts.append(f"{indent}set({rv_name} 0)\n")
+            else:
+                # No RESULT_VARIABLE found? Shouldn't happen, but fallback to
+                # emitting an empty harmless `cmake -E true` that always succeeds.
+                out_parts.append(
+                    "execute_process(COMMAND \"${CMAKE_COMMAND}\" -E true "
+                    "RESULT_VARIABLE ___ci_rc_ignore)\n"
+                )
+            i2 = j2
+        return "".join(out_parts)
+
+    # ---- Strategy 2 (fallback): the original COMMAND → bash -lc wrapper.
     out = []
     i = 0
     n = len(text)
@@ -404,7 +535,7 @@ def main() -> int:
         if "execute_process" not in src:
             continue
         try:
-            dst = patch_execute_process(src)
+            dst = patch_execute_process(src, filename_for_context=str(p))
         except Exception as e:
             # Never let a single malformed impl.cmake kill the whole build.
             print(f"[SKIP:parse] {p}: {type(e).__name__}: {e}", file=sys.stderr)
