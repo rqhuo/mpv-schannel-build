@@ -38,18 +38,26 @@ jobs:
             mingw-w64-i686-nasm
             mingw-w64-i686-python
 
-      - name: Overwrite mirrorlist with CN + official 3-tier fallback
+      - name: Overwrite mirrorlist (mingw32 → OFFICIAL only; others CN+official 3-tier)
         run: |
           set -e
+          # 关键：MSYS2 镜像路径结构是 /mingw/$repo/  （mingw32/mingw64/ucrt64/clang64/clangarm64）
+          #                    以及 /msys/$arch/    （x86_64 / i686）
+          # 之前写成 /mingw/i686 是错路径！CN 镜像在错路径下会给出残缺 DB，导致 ffmpeg/libbluray 等大包"target not found"。
+
+          # mingw32 (i686): 官方镜像优先（DB 最完整，含多年未更的 ffmpeg/libbluray 等大包），
+          # CN 镜像用正确路径 /mingw/mingw32 作为兜底备用（/mingw/i686 是错路径！）
           cat > /etc/pacman.d/mirrorlist.mingw32 <<'EOF'
-          Server = https://mirrors.tuna.tsinghua.edu.cn/msys2/mingw/i686
-          Server = https://mirrors.ustc.edu.cn/msys2/mingw/i686
-          Server = https://mirror.msys2.org/mingw/i686
+          Server = https://mirror.msys2.org/mingw/mingw32
+          Server = https://mirrors.tuna.tsinghua.edu.cn/msys2/mingw/mingw32
+          Server = https://mirrors.ustc.edu.cn/msys2/mingw/mingw32
           EOF
+
+          # x86_64 系列保留 CN + 官方回退
           cat > /etc/pacman.d/mirrorlist.mingw64 <<'EOF'
-          Server = https://mirrors.tuna.tsinghua.edu.cn/msys2/mingw/x86_64
-          Server = https://mirrors.ustc.edu.cn/msys2/mingw/x86_64
-          Server = https://mirror.msys2.org/mingw/x86_64
+          Server = https://mirrors.tuna.tsinghua.edu.cn/msys2/mingw/mingw64
+          Server = https://mirrors.ustc.edu.cn/msys2/mingw/mingw64
+          Server = https://mirror.msys2.org/mingw/mingw64
           EOF
           cat > /etc/pacman.d/mirrorlist.ucrt64 <<'EOF'
           Server = https://mirrors.tuna.tsinghua.edu.cn/msys2/mingw/ucrt64
@@ -66,13 +74,40 @@ jobs:
           Server = https://mirrors.ustc.edu.cn/msys2/mingw/clangarm64
           Server = https://mirror.msys2.org/mingw/clangarm64
           EOF
+
+          # msys 核心仓库路径是 /msys/$arch
           cat > /etc/pacman.d/mirrorlist.msys <<'EOF'
           Server = https://mirrors.tuna.tsinghua.edu.cn/msys2/msys/$arch
           Server = https://mirrors.ustc.edu.cn/msys2/msys/$arch
           Server = https://mirror.msys2.org/msys/$arch
           EOF
+
+          # 清掉 DB 缓存 + 强制重拉所有数据库（确保 mingw32.db 是官方完整版本）
+          pacman -Scc --noconfirm || true
           pacman -Syy --noconfirm
           pacman -Suu --noconfirm || true
+
+      - name: Diagnostic: confirm mingw32 DB has ffmpeg/libbluray/dvdnav entries
+        run: |
+          set +e
+          echo "===== MSYSTEM / MINGW_PACKAGE_PREFIX ====="
+          echo "MSYSTEM=${MSYSTEM}"
+          echo "MINGW_PACKAGE_PREFIX=${MINGW_PACKAGE_PREFIX}"
+          echo "===== pacman -Ss (核心包可见性) ====="
+          for p in ffmpeg libbluray libdvdnav libdvdread libass freetype harfbuzz \
+                   fribidi uchardet rubberband libsamplerate soxr openal mpg123 \
+                   libvorbis libogg opus opusfile flac wavpack libplacebo libvpx \
+                   zimg luajit libarchive lcms2 libjpeg-turbo libpng dav1d x264 \
+                   shaderc spirv-cross vulkan-loader libvpl sdl2; do
+            out="$(pacman -Ss "^${MINGW_PACKAGE_PREFIX}-${p}$" 2>&1)"
+            if [ -n "$out" ]; then
+              echo "[FOUND] ${MINGW_PACKAGE_PREFIX}-${p}"
+              echo "        ${out}"
+            else
+              echo "[MISSING] ${MINGW_PACKAGE_PREFIX}-${p}（安装时会跳过或报错）"
+            fi
+          done
+          true
 
       - name: Install MANDATORY mingw32 libs (fail hard if missing)
         run: |
