@@ -1,0 +1,223 @@
+name: build-libmpv2-i686-schannel
+
+on:
+  push:
+    paths:
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: libmpv-2.dll i686 (no-openssl / schannel)
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Checkout (empty ok; mpv fetched separately)
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2 MINGW32 (current DB, no archive fallback)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW32
+          update: true
+          install: >-
+            base-devel
+            git
+            yasm
+            nasm
+            mingw-w64-i686-toolchain
+            mingw-w64-i686-meson
+            mingw-w64-i686-ninja
+            mingw-w64-i686-pkg-config
+            mingw-w64-i686-cmake
+            mingw-w64-i686-nasm
+            mingw-w64-i686-python
+
+      - name: Overwrite mirrorlist with CN + official 3-tier fallback
+        run: |
+          set -e
+          cat > /etc/pacman.d/mirrorlist.mingw32 <<'EOF'
+          Server = https://mirrors.tuna.tsinghua.edu.cn/msys2/mingw/i686
+          Server = https://mirrors.ustc.edu.cn/msys2/mingw/i686
+          Server = https://mirror.msys2.org/mingw/i686
+          EOF
+          cat > /etc/pacman.d/mirrorlist.mingw64 <<'EOF'
+          Server = https://mirrors.tuna.tsinghua.edu.cn/msys2/mingw/x86_64
+          Server = https://mirrors.ustc.edu.cn/msys2/mingw/x86_64
+          Server = https://mirror.msys2.org/mingw/x86_64
+          EOF
+          cat > /etc/pacman.d/mirrorlist.ucrt64 <<'EOF'
+          Server = https://mirrors.tuna.tsinghua.edu.cn/msys2/mingw/ucrt64
+          Server = https://mirrors.ustc.edu.cn/msys2/mingw/ucrt64
+          Server = https://mirror.msys2.org/mingw/ucrt64
+          EOF
+          cat > /etc/pacman.d/mirrorlist.clang64 <<'EOF'
+          Server = https://mirrors.tuna.tsinghua.edu.cn/msys2/mingw/clang64
+          Server = https://mirrors.ustc.edu.cn/msys2/mingw/clang64
+          Server = https://mirror.msys2.org/mingw/clang64
+          EOF
+          cat > /etc/pacman.d/mirrorlist.clangarm64 <<'EOF'
+          Server = https://mirrors.tuna.tsinghua.edu.cn/msys2/mingw/clangarm64
+          Server = https://mirrors.ustc.edu.cn/msys2/mingw/clangarm64
+          Server = https://mirror.msys2.org/mingw/clangarm64
+          EOF
+          cat > /etc/pacman.d/mirrorlist.msys <<'EOF'
+          Server = https://mirrors.tuna.tsinghua.edu.cn/msys2/msys/$arch
+          Server = https://mirrors.ustc.edu.cn/msys2/msys/$arch
+          Server = https://mirror.msys2.org/msys/$arch
+          EOF
+          pacman -Syy --noconfirm
+          pacman -Suu --noconfirm || true
+
+      - name: Install MANDATORY mingw32 libs (fail hard if missing)
+        run: |
+          set -e
+          # 核心依赖：缺了 mpv 就编不出来，或者 BD/DVD 就播不了。必须全部成功。
+          pacman -S --needed --noconfirm --ask=20 \
+            mingw-w64-i686-ffmpeg \
+            mingw-w64-i686-libbluray \
+            mingw-w64-i686-libdvdnav \
+            mingw-w64-i686-libdvdread \
+            mingw-w64-i686-libarchive \
+            mingw-w64-i686-libjpeg-turbo \
+            mingw-w64-i686-libpng \
+            mingw-w64-i686-lcms2 \
+            mingw-w64-i686-libass \
+            mingw-w64-i686-freetype \
+            mingw-w64-i686-harfbuzz \
+            mingw-w64-i686-fribidi \
+            mingw-w64-i686-uchardet \
+            mingw-w64-i686-rubberband \
+            mingw-w64-i686-libsamplerate \
+            mingw-w64-i686-soxr \
+            mingw-w64-i686-openal \
+            mingw-w64-i686-mpg123 \
+            mingw-w64-i686-libvorbis \
+            mingw-w64-i686-libogg \
+            mingw-w64-i686-opusfile \
+            mingw-w64-i686-opus \
+            mingw-w64-i686-flac \
+            mingw-w64-i686-wavpack \
+            mingw-w64-i686-libplacebo \
+            mingw-w64-i686-libvpx \
+            mingw-w64-i686-zimg \
+            mingw-w64-i686-luajit \
+            mingw-w64-i686-zlib \
+            mingw-w64-i686-bzip2 \
+            mingw-w64-i686-zstd \
+            mingw-w64-i686-lz4 \
+            mingw-w64-i686-libiconv
+          pkg-config --modversion libavcodec libbluray dvdnav luajit libplacebo
+
+      - name: Install OPTIONAL mingw32 libs (skip missing; meson will auto-disable)
+        run: |
+          # 这些库在 i686 上经常被砍掉。单个安装，装不上就跳过，meson 会自动 -Dxxx=disabled。
+          for pkg in \
+            mingw-w64-i686-shaderc \
+            mingw-w64-i686-spirv-cross \
+            mingw-w64-i686-vulkan-loader \
+            mingw-w64-i686-libvpl \
+            mingw-w64-i686-dav1d \
+            mingw-w64-i686-x264
+          do
+            echo "---- trying $pkg ----"
+            pacman -S --needed --noconfirm --ask=20 "$pkg" && echo "[OK] $pkg installed" || echo "[SKIP] $pkg not available"
+          done
+          true
+
+      - name: Clone mpv v0.41.0
+        run: |
+          set -e
+          cd "${GITHUB_WORKSPACE:-/c/trae}"
+          rm -rf mpv
+          git clone --branch v0.41.0 --depth 1 --recurse-submodules \
+            https://github.com/mpv-player/mpv.git mpv
+          cd mpv
+          git rev-parse --short HEAD
+
+      - name: meson setup (libmpv only, no openssl, schannel tls)
+        run: |
+          set -e
+          cd "${GITHUB_WORKSPACE:-/c/trae}/mpv"
+
+          # 只对"必须满足的约束"写死 =enabled / =disabled；其它功能全用 =auto，
+          # 这样 i686 镜像里如果少了 shaderc/vulkan/x264，meson 会自动 disabled，不挂构建。
+          meson setup build \
+            --buildtype=release \
+            --default-library=shared \
+            --prefix="${MINGW_PREFIX:-/mingw32}" \
+            --wrap-mode=nodownload \
+            -Dlibmpv=true \
+            -Dcplayer=false \
+            -Dclient-api=enabled \
+            -Diconv=enabled \
+            -Dlua=luajit \
+            -Djavascript=disabled \
+            -Dopenssl=disabled \
+            -Dtls-backend=schannel \
+            -Ddvdnav=enabled \
+            -Dbluray=enabled \
+            -Dlibarchive=auto \
+            -Dlcms2=auto \
+            -Dlibjpeg=auto \
+            -Duchardet=auto \
+            -Drubberband=auto \
+            -Dlibplacebo=auto \
+            -Dshaderc=auto \
+            -Dspirv-cross=auto \
+            -Dvulkan=auto \
+            -Dlibvpl=auto \
+            -Dopenal=auto \
+            -Dsdl2=disabled \
+            -Dgl=auto \
+            -Degl=auto \
+            -Dwayland=disabled \
+            -Dx11=disabled \
+            -Dd3d11=auto \
+            -Ddxvahd=auto \
+            -Dwasapi=auto \
+            -Dwinmm=auto
+          # Summary for debug
+          meson configure build | sed -n '1,200p'
+
+      - name: Compile
+        run: |
+          set -e
+          cd "${GITHUB_WORKSPACE:-/c/trae}/mpv"
+          meson compile -C build --verbose
+          ls -la build/*.dll build/*.exe build/libmpv* 2>/dev/null || true
+          ls -la build/subprojects/*/libmpv* 2>/dev/null || true
+
+      - name: Locate libmpv-2.dll
+        run: |
+          set -e
+          cd "${GITHUB_WORKSPACE:-/c/trae}/mpv"
+          DLL="$(find build -maxdepth 3 -type f \( -name 'libmpv-2.dll' -o -name 'mpv-2.dll' \) -print -quit)"
+          if [ -z "$DLL" ]; then
+            echo "!!! libmpv-2.dll NOT FOUND"
+            find build -maxdepth 4 -type f \( -name '*.dll' -o -name '*.exe' \)
+            exit 21
+          fi
+          echo "FOUND_DLL=${DLL}"
+          mkdir -p "${GITHUB_WORKSPACE:-/c/trae}/artifact"
+          cp -f "$DLL" "${GITHUB_WORKSPACE:-/c/trae}/artifact/libmpv-2.dll"
+          # Also copy the import lib for users who want to link against it
+          IMP="$(find build -maxdepth 3 -type f \( -name 'libmpv.dll.a' -o -name 'libmpv.dll.a.dll.a' \) -print -quit || true)"
+          [ -n "$IMP" ] && cp -f "$IMP" "${GITHUB_WORKSPACE:-/c/trae}/artifact/libmpv.dll.a" || true
+          EXP_H="$(find . -maxdepth 3 -type f -name 'client.h' -path '*/mpv/*' -print -quit || true)"
+          [ -n "$EXP_H" ] && cp -f "$EXP_H" "${GITHUB_WORKSPACE:-/c/trae}/artifact/mpv_client.h" || true
+          ls -la "${GITHUB_WORKSPACE:-/c/trae}/artifact/"
+          file "${GITHUB_WORKSPACE:-/c/trae}/artifact/libmpv-2.dll" || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libmpv-2-i686-schannel
+          path: ${{ github.workspace }}/artifact/*
+          if-no-files-found: error
+          compression-level: 6
