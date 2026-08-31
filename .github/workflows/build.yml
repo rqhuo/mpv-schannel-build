@@ -87,7 +87,7 @@ jobs:
           pacman -Syy --noconfirm
           pacman -Suu --noconfirm || true
 
-      - name: Diagnostic: confirm mingw32 DB has ffmpeg/libbluray/dvdnav entries
+      - name: Diagnostic - confirm mingw32 DB has ffmpeg/libbluray/dvdnav entries
         run: |
           set +e
           echo "===== MSYSTEM / MINGW_PACKAGE_PREFIX ====="
