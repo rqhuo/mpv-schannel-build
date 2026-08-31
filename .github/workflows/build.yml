@@ -1,237 +1,264 @@
-"name": "Build libmpv-2.dll v0.41.0 (i686) — dead-end-free via OFFICIAL shinchiro toolchain — NO pacman needed"
+"name": "Build libmpv-2.dll v0.41.0 (i686) — TIME-CAPSULE pacman DB pinned to 20240811 (last date with FULL mingw32 multimedia tree)"
 "on":
   "workflow_dispatch":
   "push":
     "branches": ["main"]
-"env":
-  # Which exact toolchain build shinchiro released today? (We pin a known-good date for reproducibility)
-  SHINCHIRO_RELEASE_DATE: "20260831"
-  SHINCHIRO_RELEASE_TAG: "20260831"
-  MPV_TAG: "v0.41.0"
-
 "jobs":
   "build":
-    "runs-on": "windows-2022"
-    "timeout-minutes": 120
-    "defaults":
-      "run":
-        "shell": "pwsh"
+    "runs-on": "windows-latest"
+    "timeout-minutes": 180
     "steps":
       - "name": "Checkout"
         "uses": "actions/checkout@v4"
 
-      - "name": "Create work directory and download shinchiro MINGW32 prebuilt toolchain (the EXACT same toolchain mpv Windows official builds use)"
+      - "name": "Setup base MSYS2 (empty install, no deps via pacboy)"
+        "uses": "msys2/setup-msys2@v2"
+        "with":
+          "msystem": "MINGW32"
+          "update": true
+          "install": ""
+
+      - "name": "TIME-CAPSULE: replace pacman sync DB with 2024-08-11 snapshot (last mingw32 tree with ffmpeg/libbluray/dvdnav), point mirrors to the official archive"
+        "shell": "msys2 {0}"
         "run": |
-          $ErrorActionPreference = "Stop"
-          $workDir = "C:\mpv-build"
-          New-Item -ItemType Directory -Force -Path $workDir | Out-Null
-          Set-Location $workDir
+          set +e
+          echo "============================================================"
+          echo "[MINGW_PACKAGE_PREFIX] $MINGW_PACKAGE_PREFIX"
+          echo "[MSYSTEM]              $MSYSTEM"
+          echo "============================================================"
 
-          # shinchiro publishes every build as: mpv-i686-{date}-git-xxxxxxx.7z (runtime) AND corresponding source pkg spec with deps
-          # What we really need is the "build environment" tarball that contains mingw32 toolchain + ALL prebuilt libs (ffmpeg, libbluray, ...).
-          # shinchiro publishes a self-contained build env package called:  mingw32-toolchain-{version}.zip
-          # Recent releases put ALL build artifacts (pacman db + installed /mingw32 tree + /usr tree) into a single 7z for every run, so we fetch that whole env.
-          # Conveniently, shinchiro maintains a separate "llvm-mingw" release but we want the regular mingw-w64-i686 one he uses himself for mpv-i686 builds.
-          # Direct URL pattern for his latest published build (dated env 7z):
-          $url = "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/$env:SHINCHIRO_RELEASE_TAG/mpv-winbuild-cmake-mingw-w64-i686-$env:SHINCHIRO_RELEASE_TAG.7z"
-          Write-Host "=== Downloading shinchiro canonical i686 build env 7z ==="
-          Write-Host "  $url"
-          $zip = "env.7z"
-          try {
-            Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -TimeoutSec 600
-          } catch {
-            Write-Host "WARNING: exact env 7z not found for tag $env:SHINCHIRO_RELEASE_TAG, falling back to the older known-good tag 20240811..."
-            $url2 = "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20240811/mpv-winbuild-cmake-mingw-w64-i686-20240811.7z"
-            Write-Host "  $url2"
-            Invoke-WebRequest -Uri $url2 -OutFile $zip -UseBasicParsing -TimeoutSec 600
-          }
-          Write-Host "Downloaded $((Get-Item $zip).Length) bytes"
+          # Step 1: kill any leftover pacman lock + remove the BROKEN current DBs
+          rm -f /var/lib/pacman/db.lck /var/lib/pacman/db.lck.broken
+          rm -f /var/lib/pacman/sync/*.db
+          rm -f /var/lib/pacman/sync/*.db.tar.gz
+          rm -f /var/lib/pacman/sync/*.db.tar.xz
+          ls -la /var/lib/pacman/sync/ 2>/dev/null || echo "(sync dir empty, as expected)"
 
-          # Extract with 7z via GitHub Actions' bundled 7z
-          Write-Host "=== Extracting env 7z into C:\mingw32root ==="
-          $dest = "C:\mingw32root"
-          New-Item -ItemType Directory -Force -Path $dest | Out-Null
-          & 7z x "$zip" "-o$dest" -y | Select-Object -Last 5
+          # Step 2: download the 2024-08-11 pacman sync DB snapshots from the official MSYS2 archive
+          # Archive URL pattern is:  https://archive.msys2.org/YYYY/MM/YYYY-MM-DD/<repo>.db.tar.xz
+          #   - mingw32.db.tar.xz -> for i686 packages (ffmpeg, bluray, etc.)
+          #   - msys.db.tar.xz    -> for core msys runtime (bash, pacman, autotools, etc.)
+          echo "--- Downloading archived pacman DBs for 2024-08-11 ---"
+          cd /tmp
+          for pair in "mingw32:mingw/i686" "msys:msys/x86_64"; do
+            repo="${pair%%:*}"
+            sub="${pair#*:}"
+            url="https://archive.msys2.org/2024/08/2024-08-11/${repo}.db.tar.xz"
+            echo "  $repo <- $url"
+            curl -fsSL --retry 5 --retry-delay 3 --connect-timeout 30 -o "${repo}.db.tar.xz" "$url"
+            rc=$?
+            echo "   rc=$rc  size=$(stat --printf=%s ${repo}.db.tar.xz 2>/dev/null || echo 0) bytes"
+            if [ "$rc" -ne 0 ] || [ ! -s "${repo}.db.tar.xz" ]; then
+              echo "   archive.msys2.org failed, trying secondary mirror msys2.org/2024/ ..."
+              url2="https://repo.msys2.org/archive/2024/08/2024-08-11/${repo}.db.tar.xz"
+              curl -fsSL --retry 5 --retry-delay 3 --connect-timeout 30 -o "${repo}.db.tar.xz" "$url2" || true
+            fi
+            if [ ! -s "${repo}.db.tar.xz" ]; then
+              echo "!!! Failed to fetch ${repo} DB even after retry !!!"
+              exit 12
+            fi
+            tar -xJf "${repo}.db.tar.xz" -C /var/lib/pacman/sync/ "${repo}.db" 2>/dev/null || \
+            (
+              mkdir -p "/var/lib/pacman/sync/_${repo}"
+              tar -xJf "${repo}.db.tar.xz" -C "/var/lib/pacman/sync/_${repo}"
+              cd "/var/lib/pacman/sync/_${repo}"
+              # Some archive tarballs extract to folder per entry, concatenate desc -> db
+              find . -name 'desc' -exec cat {} + > "../${repo}.db"
+              rm -rf "/var/lib/pacman/sync/_${repo}"
+            )
+          done
 
-          # Show what we got
-          Get-ChildItem -Path $dest | Select-Object Name, Length, Mode
+          ls -la /var/lib/pacman/sync/
+          echo ""
+          echo "--- Re-point mirrorlist to OFFICIAL ARCHIVE so every old URL resolves ---"
+          cat > /etc/pacman.d/mirrorlist.mingw32 <<'EOF'
+          # 2024-08-11 archive exact match
+          Server = https://archive.msys2.org/2024/08/2024-08-11/mingw/i686
+          # Fallback: current official repo (archive packages are kept side-by-side)
+          Server = https://repo.msys2.org/mingw/i686
+          # Fallback 2: TUNA historical mirror
+          Server = https://mirrors.tuna.tsinghua.edu.cn/msys2/archive/2024/08/2024-08-11/mingw/i686
+          EOF
+          cat > /etc/pacman.d/mirrorlist.msys <<'EOF'
+          Server = https://archive.msys2.org/2024/08/2024-08-11/msys/x86_64
+          Server = https://repo.msys2.org/msys/x86_64
+          Server = https://mirrors.tuna.tsinghua.edu.cn/msys2/archive/2024/08/2024-08-11/msys/x86_64
+          EOF
+          cat > /etc/pacman.d/mirrorlist.mingw64 <<'EOF'
+          Server = https://archive.msys2.org/2024/08/2024-08-11/mingw/x86_64
+          EOF
 
-          # Locate the mingw32 tree. Layout is usually:  envroot/mingw32/{bin,include,lib}  envroot/usr/{bin,include}
-          $possible = @(
-            (Join-Path $dest "mingw32"),
-            (Join-Path $dest "mingw-i686"),
-            (Join-Path $dest "i686-w64-mingw32"),
-            (Join-Path $dest "root" "mingw32"),
-            $dest
+          # We do NOT run -Sy / -Syy any more — we just hand-placed the exact DB we want.
+          echo "--- Sanity check: how many $MINGW_PACKAGE_PREFIX packages are NOW visible to pacman? ---"
+          total=$(pacman -Sl 2>/dev/null | grep -c "^mingw32 ${MINGW_PACKAGE_PREFIX}" || echo 0)
+          echo "[Total packages] $total (should be > 4000 this time)"
+
+          if [ "$total" -lt 2000 ]; then
+            echo "!!! package count still low after time-capsule DB !!! Dumping matches for multimedia queries !!!"
+            for p in ffmpeg libbluray libdvdnav dvdread libdvdcss shaderc spirv-cross libplacebo mujs vulkan-loader angle lcms2 libass libjpeg-turbo libarchive; do
+              echo "--- pacman -Ss $p ---"
+              pacman -Ss "$p" 2>/dev/null | grep '^mingw32/' | head -n 5 || echo "(no match)"
+            done
+            exit 13
+          fi
+
+          echo "=== Sample matches for the 3 most critical packages we need ==="
+          for p in ffmpeg libbluray libdvdnav; do
+            echo "--- $p ---"
+            pacman -Ss "^${MINGW_PACKAGE_PREFIX}${p}$" 2>/dev/null | head -n 3 || echo "(NOT FOUND — bad sign)"
+          done
+          echo "=== TIME CAPSULE ready. ==="
+
+      - "name": "Install ALL build deps (use MINGW_PACKAGE_PREFIX, time-capsule DB will resolve them to 20240811 binaries)"
+        "shell": "msys2 {0}"
+        "run": |
+          set -e
+          PFX="$MINGW_PACKAGE_PREFIX"
+          echo "[Using prefix] $PFX"
+          PKGS=(
+            "toolchain" "meson" "pkgconf" "nasm"
+            "ffmpeg" "libass" "libjpeg-turbo" "libbluray"
+            "libdvdnav" "libdvdread" "libdvdcss"
+            "shaderc" "spirv-cross" "lcms2" "libarchive" "mujs"
+            "vulkan-loader" "angle-library" "libplacebo" "vulkan-headers"
           )
-          $mingw = $null
-          foreach ($p in $possible) {
-            if (Test-Path (Join-Path $p "bin\gcc.exe")) { $mingw = $p; break }
-          }
-          if (-not $mingw) {
-            Write-Host "!!! Could not find mingw32 tree. Full recursive listing of first 3 levels !!!"
-            Get-ChildItem -Path $dest -Depth 3 -ErrorAction SilentlyContinue | Select-Object FullName | Select-Object -First 200
-            exit 7
-          }
-          Write-Host "=== MINGW32 ROOT = $mingw ==="
-          $env:MINGW32_ROOT = $mingw
-          # Persist for subsequent steps via GITHUB_OUTPUT + GITHUB_PATH
-          "MINGW32_ROOT=$mingw" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          # Add critical bins to GITHUB_PATH so meson/pkg-config can find them without full msys2 shell
-          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $mingw "bin")
-          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $dest "usr\bin")
-          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $dest "bin")
-          Write-Host "=== Quick toolchain probe ==="
-          & (Join-Path $mingw "bin\gcc.exe") --version | Select-Object -First 1
-          $pkgconf = Join-Path $mingw "bin\pkg-config.exe"
-          if (Test-Path $pkgconf) { & $pkgconf --exists libavcodec ; Write-Host "pkg-config libavcodec exists= $LASTEXITCODE" }
-          $meson = Get-Command meson -ErrorAction SilentlyContinue
-          Write-Host "Meson on PATH: $(if ($meson) { $meson.Source } else { 'NOT FOUND' })"
+          FULL_PKGS=()
+          for p in "${PKGS[@]}"; do FULL_PKGS+=("${PFX}${p}"); done
+          echo "Packages: ${FULL_PKGS[*]}"
+          echo ""
 
-      - "name": "Ensure meson + ninja are present (some shinchiro env 7z strip them; install via pip-nofail)"
-        "run": |
-          $ErrorActionPreference = "Continue"
-          # meson / ninja are pure Python tools and not always in the mingw env. Install via pip if missing.
-          if (-not (Get-Command meson -ErrorAction SilentlyContinue)) {
-            Write-Host "=== meson not on PATH. Installing via pipx/pip ==="
-            python -m pip install --quiet --no-input meson ninja 2>&1 | Select-Object -Last 10
-          }
-          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
-            python -m pip install --quiet --no-input ninja 2>&1 | Select-Object -Last 5
-          }
-          if (-not (Get-Command meson -ErrorAction SilentlyContinue)) {
-            # Last resort: install from the official release
-            $mUrl = "https://github.com/mesonbuild/meson/releases/latest/download/meson.msi"
-            Write-Host "Installing meson MSI from $mUrl"
-            $mOut = "meson.msi"
-            Invoke-WebRequest -Uri $mUrl -OutFile $mOut -UseBasicParsing -TimeoutSec 300
-            Start-Process msiexec.exe -ArgumentList "/i `"$mOut`" /quiet /norestart" -Wait -NoNewWindow
-            # Refresh PATH
-            $env:PATH = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
-          }
-          Write-Host "=== Final tool versions ==="
+          # pacman -Sy ONLY to re-read the local time-capsule DB we just put in place (no network refresh)
+          pacman -Sy --noconfirm 2>&1 | tail -n 5 || true
+
+          set +e
+          pacman -S --noconfirm --needed --disable-download-timeout --overwrite='*' "${FULL_PKGS[@]}" 2>&1 | tail -n 100
+          rc=$?
+          set -e
+          echo "[pacman -S rc=$rc]"
+          echo "=== Verify mandatory ==="
+          miss=0
+          for p in ffmpeg libbluray libdvdnav libdvdread shaderc libplacebo meson pkgconf nasm gcc; do
+            full="${PFX}${p}"
+            if pacman -Qs "^${full}$" >/dev/null 2>&1; then
+              echo "  OK     $full"
+            else
+              echo "  MISS   $full"
+              miss=$((miss+1))
+            fi
+          done
+          if [ "$miss" -gt 0 ]; then
+            echo "!!! $miss mandatory packages MISS. Outputting broader searches. !!!"
+            for p in ffmpeg libbluray libdvdnav shaderc libplacebo angle vulkan; do
+              echo "--- broader $p ---"
+              pacman -Ss "$p" 2>/dev/null | grep '^mingw32/' | head -n 6 || true
+            done
+            exit 14
+          fi
+          echo "All mandatory packages present."
+          pkg-config --exists libavcodec  && echo "[pkg-config] libavcodec  YES $(pkg-config --modversion libavcodec)"  || echo "[pkg-config] libavcodec  NO"
+          pkg-config --exists libbluray   && echo "[pkg-config] libbluray   YES"  || echo "[pkg-config] libbluray   NO"
+          pkg-config --exists dvdnav       && echo "[pkg-config] dvdnav       YES"  || echo "[pkg-config] dvdnav       NO"
+          gcc --version | head -n 1
           meson --version
-          ninja --version 2>&1 | Select-Object -First 1
-          Get-Command pkg-config -ErrorAction SilentlyContinue | ForEach-Object { $_.Source }
-          if (Test-Path "env:MINGW32_ROOT") {
-            $pkg = Join-Path $env:MINGW32_ROOT "bin\pkg-config.exe"
-            if (Test-Path $pkg) {
-              Write-Host "pkg-config libavcodec:"; & $pkg --modversion libavcodec
-              Write-Host "pkg-config libbluray:" ; & $pkg --modversion libbluray
-              Write-Host "pkg-config dvdnav:"    ; & $pkg --exists dvdnav; Write-Host "  rc=$LASTEXITCODE (0=OK)"
-            }
-          }
 
-      - "name": "Clone mpv $env:MPV_TAG and dump its TRUE meson option names"
+      - "name": "Clone mpv v0.41.0 and dump its REAL meson option names"
+        "shell": "msys2 {0}"
         "run": |
-          $ErrorActionPreference = "Stop"
-          $ErrorActionPreference = "Continue"
-          Set-Location C:\mpv-build
-          git clone --depth 1 --branch $env:MPV_TAG https://github.com/mpv-player/mpv.git mpv
-          Set-Location mpv
-          Write-Host "=== mpv $(Get-Content VERSION -ErrorAction SilentlyContinue -First 1) repo checked out ==="
-          Write-Host "=== Meson option names we care about ==="
-          Get-Content meson_options.txt | Select-String -Pattern '^option\(' | ForEach-Object {
-            if ($_ -match '^option\(\s*"([^"]+)"') { $matches[1] }
-          } | Where-Object { $_ -match 'tls|openssl|angle|egl|pthread|win32|jpeg|sdl|libplacebo|lcms|archive|libmpv|cplayer|dvdnav|dvdread|bluray|ffmpeg|libass|lua|javascript|vulkan|iconv' } | Sort-Object -Unique
+          set -e
+          rm -rf mpv
+          git clone --depth 1 --branch v0.41.0 https://github.com/mpv-player/mpv.git mpv
+          cd mpv
+          echo "=== mpv v0.41.0 relevant meson options (source-of-truth dump) ==="
+          grep -E '^option\s*\(' meson_options.txt | awk -F'"' '/^option\(/{print $2}' | grep -Ei "tls|openssl|angle|egl|pthread|win32|jpeg|sdl|libplacebo|lcms|archive|libmpv|cplayer|dvdnav|dvdread|bluray|ffmpeg|libass|lua|javascript|vulkan|iconv" | sort -u
 
-      - "name": "meson setup + compile (use plain pwsh with correct env vars, NO msys2 shell)"
+      - "name": "Configure meson"
+        "shell": "msys2 {0}"
         "run": |
-          $ErrorActionPreference = "Stop"
-          $ErrorActionPreference = "Continue"
-          Set-Location C:\mpv-build\mpv
-          if (Test-Path build) { Remove-Item -Recurse -Force build }
+          set -e
+          cd mpv
+          rm -rf build
+          set +e
+          meson setup build \
+            --buildtype=release \
+            --default-library=shared \
+            --prefix=/mingw32 \
+            -Dlibmpv=true \
+            -Dcplayer=false \
+            -Dtls-backend=schannel \
+            -Dopenssl=disabled \
+            -Diconv=enabled \
+            -Ddvdnav=enabled \
+            -Ddvdread=enabled \
+            -Dlibbluray=enabled \
+            -Dffmpeg=enabled \
+            -Dlibass=enabled \
+            -Dlua=disabled \
+            -Djavascript=disabled \
+            -Dvulkan=enabled \
+            -Degl=enabled \
+            -Dangle-libs=auto \
+            -Djpeg=enabled \
+            -Dlcms2=enabled \
+            -Dlibarchive=enabled \
+            -Dsdl2=disabled \
+            -Dlibplacebo=auto
+          rc=$?
+          set -e
+          if [ $rc -ne 0 ]; then
+            echo "=== meson setup FAILED, tail log ==="
+            if [ -f build/meson-logs/meson-log.txt ]; then tail -n 150 build/meson-logs/meson-log.txt; else echo "(no meson-log.txt)"; fi
+            echo "=== TRUE option names from meson_options.txt ==="
+            grep -E '^option\s*\(' meson_options.txt | awk -F'"' '/^option\(/{print $2}' | sort -u
+            exit $rc
+          fi
+          echo "=== meson SUCCESS, configure summary (top) ==="
+          meson configure build 2>&1 | head -n 80
 
-          # ---- Critical: set the env meson/pkg-config need to find our mingw32 root
-          $mingw = $env:MINGW32_ROOT
-          $env:PKG_CONFIG_PATH  = Join-Path $mingw "lib\pkgconfig"
-          $env:PKG_CONFIG_LIBDIR = $env:PKG_CONFIG_PATH
-          $env:CMAKE_PREFIX_PATH = $mingw
-          $env:CC  = Join-Path $mingw "bin\gcc.exe"
-          $env:CXX = Join-Path $mingw "bin\g++.exe"
-          $env:LD  = Join-Path $mingw "bin\ld.exe"
-          $env:PATH = (Join-Path $mingw "bin") + ";" + $env:PATH
-
-          Write-Host "=== Calling meson setup ==="
-          $mesonArgs = @(
-            "setup", "build",
-            "--buildtype=release",
-            "--default-library=shared",
-            "--prefix=$mingw",
-            "-Dlibmpv=true",
-            "-Dcplayer=false",
-            "-Dtls-backend=schannel",
-            "-Dopenssl=disabled",
-            "-Diconv=enabled",
-            "-Ddvdnav=enabled",
-            "-Ddvdread=enabled",
-            "-Dlibbluray=enabled",
-            "-Dffmpeg=enabled",
-            "-Dlibass=enabled",
-            "-Dlua=disabled",
-            "-Djavascript=disabled",
-            "-Dvulkan=enabled",
-            "-Degl=enabled",
-            "-Dangle-libs=auto",
-            "-Djpeg=enabled",
-            "-Dlcms2=enabled",
-            "-Dlibarchive=enabled",
-            "-Dsdl2=disabled",
-            "-Dlibplacebo=auto"
-          )
-          & meson @mesonArgs 2>&1 | Select-Object -Last 120
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "=== meson setup FAILED, dumping meson-log.txt last 200 lines ==="
-            $log = Join-Path (Resolve-Path build) "meson-logs\meson-log.txt" -ErrorAction SilentlyContinue
-            if ($log -and (Test-Path $log)) { Get-Content $log -Tail 200 }
-            else { Write-Host "(no meson-log.txt at $log)" }
-            exit 9
-          }
-          Write-Host "=== meson OK. Top of configure summary ==="
-          & meson configure build 2>&1 | Select-Object -First 80
-
-          Write-Host ""
-          $cores = $env:NUMBER_OF_PROCESSORS
-          Write-Host "=== Compile (meson compile -j$cores) ==="
-          & meson compile -C build -j$cores 2>&1 | Select-Object -Last 80
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "=== compile FAILED, verbose tail 250 lines ==="
-            & meson compile -C build --verbose 2>&1 | Select-Object -Last 250
-            exit 10
-          }
-          Write-Host "=== Build outputs ==="
-          Get-ChildItem build\libmpv* -ErrorAction SilentlyContinue | Format-Table Name, Length
-
-      - "name": "Collect final artifacts (libmpv-2.dll + headers + ALL runtime DLLs needed)"
+      - "name": "Compile"
+        "shell": "msys2 {0}"
         "run": |
-          $ErrorActionPreference = "Stop"
-          $outDir = "C:\mpv-build\output"
-          New-Item -ItemType Directory -Force -Path "$outDir\include" | Out-Null
+          set -e
+          cd mpv
+          cores="${NUMBER_OF_PROCESSORS:-2}"
+          echo ">>> Compiling with $cores cores <<<"
+          set +e
+          meson compile -C build -j"$cores" 2>&1 | tail -n 80
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ $rc -ne 0 ]; then
+            echo "=== compile FAILED, last 260 verbose lines ==="
+            meson compile -C build --verbose 2>&1 | tail -n 260
+            exit $rc
+          fi
+          echo "=== Build outputs ==="
+          ls -la build/libmpv* 2>/dev/null
+          (ldd build/libmpv-2.dll || true) 2>/dev/null | head -n 30
 
-          $dll = "C:\mpv-build\mpv\build\libmpv-2.dll"
-          if (-not (Test-Path $dll)) { Write-Host "!!! libmpv-2.dll NOT BUILT !!!"; Get-ChildItem C:\mpv-build\mpv\build | Format-Table Name, Length; exit 11 }
-          Copy-Item $dll $outDir
-          $imp = "C:\mpv-build\mpv\build\libmpv.dll.a"
-          if (Test-Path $imp) { Copy-Item $imp $outDir }
-
-          # Headers
-          Copy-Item C:\mpv-build\mpv\libmpv\client.h    "$outDir\include\"
-          Copy-Item C:\mpv-build\mpv\libmpv\render.h    "$outDir\include\"
-          Copy-Item C:\mpv-build\mpv\libmpv\stream_cb.h "$outDir\include\"
-
-          # Runtime DLLs: everything under $MINGW32_ROOT\bin that is needed (copy them all, safer)
-          $mingw = $env:MINGW32_ROOT
-          $allMingwDll = Get-ChildItem -Path (Join-Path $mingw "bin") -Filter "*.dll" -ErrorAction SilentlyContinue
-          Write-Host "=== Copying $($allMingwDll.Count) runtime DLLs from mingw bin ==="
-          $allMingwDll | Copy-Item -Destination $outDir -Force -ErrorAction SilentlyContinue
-
-          Write-Host ""
-          Write-Host "=== Final output directory ($(Get-ChildItem $outDir -Recurse -File | Measure-Object | Select-Object -ExpandProperty Count) files) ==="
-          Get-ChildItem $outDir | Format-Table Name, Length -AutoSize
+      - "name": "Collect artifacts"
+        "shell": "msys2 {0}"
+        "run": |
+          set -e
+          rm -rf output
+          mkdir -p output/include
+          if [ ! -f mpv/build/libmpv-2.dll ]; then echo "!!! libmpv-2.dll NOT BUILT !!!"; ls -la mpv/build/; exit 19; fi
+          cp mpv/build/libmpv-2.dll output/
+          cp mpv/build/libmpv.dll.a output/ 2>/dev/null || true
+          cp mpv/libmpv/client.h output/include/
+          cp mpv/libmpv/render.h output/include/
+          cp mpv/libmpv/stream_cb.h output/include/
+          cd output
+          if command -v ldd >/dev/null 2>&1; then
+            ldd libmpv-2.dll | grep -E '/mingw|mingw32' | awk '{print $3}' | while read -r dll; do
+              [ -f "$dll" ] && cp "$dll" . || true
+            done
+          fi
+          echo "=== Final artifacts ==="
+          ls -la
+          echo "Total files: $(find . -type f | wc -l)"
 
       - "name": "Upload artifacts"
         "if": "always()"
         "uses": "actions/upload-artifact@v4"
         "with":
-          "name": "libmpv-i686-v0410-schannel-official-toolchain"
-          "path": "C:\mpv-build\output\"
+          "name": "libmpv-i686-v0410-schannel-timecapsule"
+          "path": "output/"
