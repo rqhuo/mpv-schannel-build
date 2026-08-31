@@ -90,7 +90,7 @@ jobs:
       # fribidi / uchardet / rubberband / libplacebo / shaderc / spirv-cross / ...
       # —— 一个 pacman 多媒体包都不用装，完美绕开 i686 "target not found" 泥潭。
 
-      - name: Clone shinchiro mpv-winbuild-cmake + clone mpv v0.41.0 source (for mpv-release)
+      - name: Clone superbuild + lay out mpv source into SINGLE_SOURCE_LOCATION tree (mpv & mpv-release)
         run: |
           set -e
           ROOT="${GITHUB_WORKSPACE:-/c/trae}"
@@ -101,37 +101,67 @@ jobs:
           cd mpv-winbuild
           echo "==== SUPERBUILD HEAD / layout ===="
           echo "SUPERBUILD HEAD = $(git rev-parse --short HEAD)"
-          ls -la
-          echo "---- cmake/ ----"
-          ls cmake/ 2>/dev/null || true
-          echo "---- packages/ (new layout) ----"
-          ls packages/ 2>/dev/null || true
-          echo "---- packages/mpv-release.cmake (stack says this is line-16 EP fail) ----"
+          echo "---- packages 目录列表 (前 40 项) ----"
+          ls packages/ 2>/dev/null | head -n 40 || true
+          echo "---- packages/mpv-release.cmake (pre-patch snapshot) ----"
           [ -f packages/mpv-release.cmake ] && cat -n packages/mpv-release.cmake || true
-          echo "---- packages/CMakeLists.txt ----"
-          [ -f packages/CMakeLists.txt ] && cat -n packages/CMakeLists.txt || true
+          echo "---- packages/mpv.cmake (pre-patch snapshot) ----"
+          [ -f packages/mpv.cmake ] && cat -n packages/mpv.cmake || true
+          echo "---- packages/ffmpeg.cmake (pre-patch snapshot, head) ----"
+          [ -f packages/ffmpeg.cmake ] && (head -n 60 packages/ffmpeg.cmake; echo "..."; tail -n 40 packages/ffmpeg.cmake) || true
           echo "---- grep ExternalProject packages/ ----"
           grep -rnE "ExternalProject_Add\s*\(\s*(mpv|ffmpeg|libbluray|libdvdnav)" packages/ 2>/dev/null || echo "(not found)"
 
-          # ---- 单独在 $SB/src/mpv 放一份 mpv v0.41.0 源码 ----
-          #      新版 superbuild 的 mpv-release ExternalProject 不给 URL/GIT，
-          #      需要外部提供 SOURCE_DIR；用本地源码直接塞给它，彻底绕开下载阶段。
+          # ---- 用 superbuild 官方的 SINGLE_SOURCE_LOCATION 机制喂源码 ----
+          #      packages/CMakeLists.txt L112-114:
+          #        if(NOT ${SINGLE_SOURCE_LOCATION} STREQUAL "")
+          #            set(SOURCE_LOCATION "${SINGLE_SOURCE_LOCATION}/${package}")
+          #        endif()
+          #      → 只要把源码放到 <PARENT>/mpv-release/ 和 <PARENT>/mpv/ 两个目录，
+          #        顶层 cmake -DSINGLE_SOURCE_LOCATION=<PARENT>，mpv-release.cmake 第 43 行
+          #        `SOURCE_DIR ${SOURCE_LOCATION}` 就会自动指到存在的非空目录，
+          #        即使第 42 行 `URL ${LINK}` 里 LINK 为空（curl GitHub API 限流/失败）也 OK。
           SB="$ROOT/mpv-winbuild"
-          mkdir -p "$SB/src"
-          rm -rf "$SB/src/mpv"
-          git -C "$SB/src" clone \
+          rm -rf "$SB/single_source"
+          mkdir -p "$SB/single_source"
+          # 先 clone 到 mpv-release/，因为 mpv-release 是我们真正要编译的 EP 名字
+          git -C "$SB/single_source" clone \
             --branch v0.41.0 --depth 1 --recurse-submodules \
-            https://github.com/mpv-player/mpv.git mpv
-          git -C "$SB/src/mpv" rev-parse --short HEAD
-          ls -la "$SB/src/mpv" | head -n 20
+            https://github.com/mpv-player/mpv.git mpv-release
+          # 然后复制一份给 mpv.cmake 这个 EP（packages/CMakeLists.txt 第 96 行也 include 了），
+          # 避免 mpv EP 也报 No download info（即使 mpv EP 本身不用，cmake configure 也会扫到）
+          cp -r "$SB/single_source/mpv-release" "$SB/single_source/mpv"
 
-          # ---- msys2 路径转 Windows 绝对路径，给 ExternalProject SOURCE_DIR 使用 ----
-          #      ExternalProject + cmake -E 对 msys 风格 /c/xxx 有时会误判成相对路径，
-          #      用 cygpath -m 换成 C:/xxx/... 更稳。
-          MPV_SRC_WIN="$(cygpath -m "$SB/src/mpv")"
-          echo "MPV_SRC_MINGW=$SB/src/mpv"
-          echo "MPV_SRC_WIN=$MPV_SRC_WIN"
-          echo "$MPV_SRC_WIN" > "$SB/MPV_SRC_WIN.txt"
+          echo "---- single_source tree layout ----"
+          ls -la "$SB/single_source/"
+          git -C "$SB/single_source/mpv-release" rev-parse --short HEAD
+          ls "$SB/single_source/mpv-release" | head -n 30
+
+          # ---- git clone 出来的源码没有 tarball 才有的 MPV_VERSION 文件 ----
+          #      mpv-release.cmake L79-85 有个 Add_Step copy-versionfile：
+          #        COMMAND bash -c "cp MPV_VERSION <INSTALL_DIR>/MPV_VERSION"
+          #        WORKING_DIRECTORY <SOURCE_DIR>
+          #      如果 SOURCE_DIR 里没有 MPV_VERSION，build 中途会在这里挂掉。
+          #      mpv 源码里有 VERSION 文件（纯文本版本号），把它复制一份改名 MPV_VERSION。
+          for d in "$SB/single_source/mpv-release" "$SB/single_source/mpv"; do
+            if [ -f "$d/VERSION" ] && [ ! -f "$d/MPV_VERSION" ]; then
+              cp "$d/VERSION" "$d/MPV_VERSION"
+              echo "MPV_VERSION ($d) = $(cat "$d/MPV_VERSION")"
+            elif [ ! -f "$d/MPV_VERSION" ]; then
+              echo "v0.41.0" > "$d/MPV_VERSION"
+            fi
+          done
+
+          # ---- 转 Windows 绝对路径写入文件，后续步骤都读这个 txt ----
+          SINGLE_SRC_PARENT_WIN="$(cygpath -m "$SB/single_source")"
+          MPV_SRC_WIN_RELEASE="$(cygpath -m "$SB/single_source/mpv-release")"
+          MPV_SRC_WIN_MPV="$(cygpath -m "$SB/single_source/mpv")"
+          echo "SINGLE_SRC_PARENT_WIN=$SINGLE_SRC_PARENT_WIN"
+          echo "MPV_SRC_WIN_RELEASE=$MPV_SRC_WIN_RELEASE"
+          echo "MPV_SRC_WIN_MPV=$MPV_SRC_WIN_MPV"
+          echo "$SINGLE_SRC_PARENT_WIN" > "$SB/SINGLE_SRC_PARENT_WIN.txt"
+          echo "$MPV_SRC_WIN_RELEASE"    > "$SB/MPV_SRC_WIN_RELEASE.txt"
+          echo "$MPV_SRC_WIN_MPV"        > "$SB/MPV_SRC_WIN_MPV.txt"
 
       # -------- 注入 no-OpenSSL + 优先 Schannel --------
       #
@@ -145,189 +175,71 @@ jobs:
       #     —— 凡是 mpv 的 meson setup/option 数组，强制追加
       #        -Dopenssl=disabled -Dtls-backend=schannel
 
-      - name: Hard-patch mpv-release SOURCE_DIR + no-openssl/schannel (packages/ + cmake/)
+      - name: Inject v12.2 via python (no perl / no heredoc / no MVEOF whitespace bugs)
         run: |
           set -e
           SB="${GITHUB_WORKSPACE:-/c/trae}/mpv-winbuild"
           cd "$SB"
-          MPV_SRC_WIN="$(cat "$SB/MPV_SRC_WIN.txt")"
-          echo "MPV_SRC_WIN=$MPV_SRC_WIN"
-
-          echo "==== 1) mpv-release.cmake: 强制塞 SOURCE_DIR（根治 no-download-info 报错） ===="
-          F=packages/mpv-release.cmake
-          if [ -f "$F" ]; then
-            echo "-- pre-inject $F --"
-            cat -n "$F"
-            # 方法A: 在 ExternalProject_Add(mpv-release 或 mpv) 后面紧跟的位置插入 SOURCE_DIR
-            #        正则匹配整个 ExternalProject_Add(...)\) 块，在 CONFIGURE_COMMAND/任何关键字参数之前或
-            #        紧贴 mpv-release 后插入 SOURCE_DIR "${MPV_SRC_WIN}"。
-            perl -i -0pe \
-              's/(ExternalProject_Add\s*\(\s*mpv(?:-release)?\b)/$1\n  SOURCE_DIR "'"$MPV_SRC_WIN"'"\n  UPDATE_COMMAND ""\n  PATCH_COMMAND ""/sgi' \
-              "$F" || true
-            # 方法B: 兜底 sed: 找到 ExternalProject_Add 行后在第 2 行单独插入 SOURCE_DIR
-            if ! grep -q "SOURCE_DIR" "$F"; then
-              sed -i -E "0,/(ExternalProject_Add\s*\(\s*mpv)/s//ExternalProject_Add_SOURCES_HACK\nSOURCE_DIR \"$MPV_SRC_WIN\"\nUPDATE_COMMAND \"\"\nPATCH_COMMAND \"\"\n\0/" "$F" 2>/dev/null \
-                || sed -i "1a if(1) endif()\n# nothing" "$F" >/dev/null 2>&1 || true
-            fi
-            # 方法C: 再狠一点：如果 ExternalProject_Add 中仍然没 SOURCE_DIR，就手工 append 到括号内
-            if ! grep -q "SOURCE_DIR" "$F"; then
-              # 在紧挨着的 ")" 结束 ExternalProject_Add 的前一行前插入
-              perl -i -0pe \
-                's/(ExternalProject_Add\s*\(\s*mpv(?:-release)?\b.*?)(\s*\)\s*)$/$1\n  SOURCE_DIR "'"$MPV_SRC_WIN"'"\n  UPDATE_COMMAND ""\n  PATCH_COMMAND ""\n$2/sgi' "$F" || true
-            fi
-            echo "-- post-inject $F --"
-            cat -n "$F"
-          else
-            echo "[WARN] packages/mpv-release.cmake not found; trying legacy mpv.cmake paths"
-            ls packages/ cmake/ 2>/dev/null
-            find . -name '*mpv*.cmake' -print 2>/dev/null
-          fi
-
-          echo "==== 2) 搜索范围 = packages/ + cmake/ + CMakeLists.txt（新版 superbuild 脚本在 packages/） ===="
-          SEARCH_DIRS="packages cmake ."
-          CMAKE_FILES="$(find $SEARCH_DIRS -type f \( -name '*.cmake' -o -name 'CMakeLists.txt' \) 2>/dev/null | tr '\n' ' ')"
-          echo "CMake files under scan: $CMAKE_FILES"
-          grep -rlE "ExternalProject_Add\s*\(\s*(ffmpeg|libbluray|libdvdnav|mpv)" packages cmake . 2>/dev/null || true
-
-          echo "==== 3) ffmpeg: 追加 --disable-openssl --enable-schannel --disable-gnutls ===="
-
-          # 3A: 直接改 ExternalProject_Add(ffmpeg ... CONFIGURE_COMMAND ...) 结尾
-          for f in $(grep -rlE "ExternalProject_Add\s*\(\s*ffmpeg" packages cmake . 2>/dev/null); do
-            echo "-- patch ffmpeg EP in: $f"
-            perl -i -0pe \
-              's/(ExternalProject_Add\s*\(\s*ffmpeg\b.*?CONFIGURE_COMMAND\s+.*?)(\s*\)\s*)$/$1 --disable-openssl --enable-schannel --disable-gnutls --disable-libtls --disable-mbedtls $2/si' "$f" \
-              || echo "   perl-skip-1: $f"
-          done
-
-          # 3B: 兜底 sed: 在 ffmpeg 的任何 CONFIGURE_ARGS 数组中追加
-          for f in $CMAKE_FILES; do
-            [ -f "$f" ] || continue
-            if grep -qiE "ffmpeg" "$f" && ! grep -q "DISABLE_OPENSSL_INJECTED" "$f"; then
-              cat >> "$f" <<'FFEOF'
-
-              # --- BEGIN: INJECTED by CI [DISABLE_OPENSSL_INJECTED] ---
-              if(COMMAND list)
-                foreach(_v IN ITEMS
-                    FFMPEG_CONFIGURE_ARGS              ffmpeg_CONFIGURE_ARGS
-                    FFMPEG_OPTIONS                     ffmpeg_OPTIONS
-                    FFMPEG_EXTRA_OPTIONS               ffmpeg_EXTRA_OPTIONS
-                    FFMPEG_ADDITIONAL_CONFIGURE_FLAGS  ffmpeg_ADDITIONAL_CONFIGURE_FLAGS
-                    FFMPEG_CONFIGURE_EXTRA_FLAGS       ffmpeg_CONFIGURE_EXTRA_FLAGS
-                    FFMPEG_EXTRA_CONFIGURE_ARGS        ffmpeg_EXTRA_CONFIGURE_ARGS
-                    FFMPEG_EXTRA                       ffmpeg_EXTRA)
-                  if(DEFINED ${_v})
-                    list(APPEND ${_v}
-                      "--disable-openssl"
-                      "--enable-schannel"
-                      "--disable-gnutls"
-                      "--disable-mbedtls"
-                      "--disable-libtls")
-                    set(${_v} "${${_v}}" CACHE INTERNAL "" FORCE)
-                  endif()
-                endforeach()
-              endif()
-              # --- END: INJECTED by CI ---
-          FFEOF
-            fi
-          done
-
-          echo "==== 4) mpv (支持 mpv / mpv-release 两种 EP 名字): meson 追加 -Dopenssl=disabled -Dtls-backend=schannel ===="
-
-          # 4A: 改 ExternalProject_Add 中 meson setup 调用
-          for f in $(grep -rlE "ExternalProject_Add\s*\(\s*mpv(|-release)\b" packages cmake . 2>/dev/null); do
-            echo "-- patch mpv EP in: $f"
-            perl -i -0pe \
-              's/(ExternalProject_Add\s*\(\s*mpv(?:-release)?\b.*?CONFIGURE_COMMAND\s+.*?meson\s+setup\b.*?)(\s*\)\s*)$/$1 -Dopenssl=disabled -Dtls-backend=schannel $2/sgi' "$f" \
-              || echo "   perl-skip-2: $f"
-          done
-
-          # 4B: 兜底：任何 cmake 文件里如果有 mpv 相关 meson options 数组变量，追加上去
-          for f in $CMAKE_FILES; do
-            [ -f "$f" ] || continue
-            if grep -qiE "mpv.*meson|libmpv|MPV_EXTRA|MPV_OPTION|mpv.*option" "$f"; then
-              if ! grep -q "MPV_SCHANNEL_INJECTED" "$f"; then
-                cat >> "$f" <<'MVEOF'
-
-                # --- BEGIN: INJECTED by CI [MPV_SCHANNEL_INJECTED] ---
-                if(COMMAND list)
-                  foreach(_v IN ITEMS
-                      MPV_MESON_OPTIONS               mpv_MESON_OPTIONS
-                      MPV_OPTIONS                     mpv_OPTIONS
-                      MPV_EXTRA_OPTIONS               mpv_EXTRA_OPTIONS
-                      MPV_ADDITIONAL_MESON_FLAGS      mpv_ADDITIONAL_MESON_FLAGS
-                      MPV_CONFIGURE_ARGS              mpv_CONFIGURE_ARGS
-                      MPV_EXTRA_MESON_OPTIONS         mpv_EXTRA_MESON_OPTIONS
-                      MPV_MESON_EXTRA_FLAGS           mpv_MESON_EXTRA_FLAGS
-                      MPV_MESON_ARGS                  mpv_MESON_ARGS)
-                    if(DEFINED ${_v})
-                      list(APPEND ${_v} "-Dopenssl=disabled" "-Dtls-backend=schannel")
-                      set(${_v} "${${_v}}" CACHE INTERNAL "" FORCE)
-                    endif()
-                  endforeach()
-                endif()
-                # --- END: INJECTED by CI ---
-            MVEOF
-              fi
-            fi
-          done
-
-          echo "==== 5) 终极 sed 兜底: 所有 CMake 文件上的 --enable-openssl / -Dlua= / --enable-gnutls 直接批量改 ===="
-          find packages cmake . -maxdepth 4 -type f \( -name '*.cmake' -o -name 'CMakeLists.txt' \) -print0 2>/dev/null \
-            | xargs -0 sed -i \
-                -e 's/\(-Dlua=[A-Za-z0-9_.-]*\)/\1 -Dopenssl=disabled -Dtls-backend=schannel/g' \
-                -e 's/--enable-openssl\b/--disable-openssl --enable-schannel/g' \
-                -e 's/--enable-gnutls\b/--disable-gnutls/g' \
-                -e 's/--enable-mbedtls\b/--disable-mbedtls/g' \
-                -e 's/--enable-libtls\b/--disable-libtls/g' \
-              || true
-
-          echo "==== 6) diff 总览（给下一轮失败时定位用） ===="
+          # 注意：clone 步骤 v12.1 写的 txt 名字（必须对上否则读空串）
+          PARENT_WIN="$(cat "$SB/SINGLE_SRC_PARENT_WIN.txt")"
+          REL_WIN="$(cat "$SB/MPV_SRC_WIN_RELEASE.txt")"
+          MPV_WIN="$(cat "$SB/MPV_SRC_WIN_MPV.txt")"
+          echo "PARENT_WIN=$PARENT_WIN"
+          echo "REL_WIN   =$REL_WIN"
+          echo "MPV_WIN   =$MPV_WIN"
+          # actions/checkout 把我们的仓库放到 GITHUB_WORKSPACE，所以 patch 脚本就在那里
+          HELPER="${GITHUB_WORKSPACE:-/c/trae}/.github/workflows/patch_superbuild.py"
+          echo "helper=$HELPER"
+          ls -la "$HELPER"
+          python "$HELPER" "$SB" "$PARENT_WIN" "$REL_WIN" "$MPV_WIN"
+          echo "==== git diff --stat after python patch ===="
           git --no-pager diff --stat || true
-          echo "--- mpv-release.cmake diff ---"
+          echo "---- git diff packages/mpv-release.cmake ----"
           git --no-pager diff -- packages/mpv-release.cmake || true
 
       # -------- CMake configure superbuild (i686) --------
-      - name: CMake configure (TARGET_ARCH = i686)
+      - name: CMake configure v12.2 - TARGET_ARCH=i686 + SINGLE_SOURCE_LOCATION
         run: |
           set -e
           SB="${GITHUB_WORKSPACE:-/c/trae}/mpv-winbuild"
           cd "$SB"
-          MPV_SRC_WIN="$(cat "$SB/MPV_SRC_WIN.txt")"
+          # clone 步骤 v12.1 写的 txt 名字（必须对上）
+          PARENT_WIN="$(cat "$SB/SINGLE_SRC_PARENT_WIN.txt")"
 
-          echo "MPV_SRC_WIN=$MPV_SRC_WIN"
+          echo "SINGLE_SOURCE_LOCATION=$PARENT_WIN"
           echo "==== packages 目录 list（再次确认新结构） ===="
           ls packages/ 2>/dev/null | head -n 60
-          echo "==== mpv-release.cmake 当前 SOURCE_DIR 检查 ===="
-          grep -n "SOURCE_DIR\|URL\|GIT_REPO" packages/mpv-release.cmake 2>/dev/null || true
+          echo "==== mpv-release.cmake 关键字检查（应无 URL \${LINK} / 有 DOWNLOAD_COMMAND \"\"） ===="
+          grep -n "SOURCE_DIR\|URL\|GIT_REPO\|DOWNLOAD_COMMAND\|UPDATE_COMMAND\|openssl\|schannel" \
+            packages/mpv-release.cmake 2>/dev/null || true
 
           # TARGET_ARCH = i686  →  superbuild 自动切 MINGW32 工具链
-          # 同时：
-          #   - 传 MPV_RELEASE_SOURCE_DIR 作为超级兜底（mpv-release ExternalProject
-          #     的 CONFIGURE_COMMAND 如果支持以 cache 变量方式取源码路径就会自动用上）
-          #   - 再把常见 cache 名（MPV_SOURCE_DIR / MPV_RELEASE_URL / ...）都填一遍
-          #   - ffmpeg / mpv 的 no-openssl schannel cache 变量名再多补几种写法
+          #
+          # 核心机制：-DSINGLE_SOURCE_LOCATION=<PARENT>
+          #   packages/CMakeLists.txt L112-114 官方支持：
+          #     set(SOURCE_LOCATION "${SINGLE_SOURCE_LOCATION}/${package}")
+          #   → mpv-release.cmake L43 SOURCE_DIR ${SOURCE_LOCATION}
+          #     自动指到 <PARENT>/mpv-release/ （git clone + 补 MPV_VERSION 的那个非空树），
+          #     完全绕过 curl GitHub API / LINK=空 的旧路。
+          #
+          # 多一层保险：ffmpeg / mpv 的常见 cache 变量 extra-options 也一起塞一遍
+          # （就算 superbuild 某天换了变量名，python patch step 还有"硬改文件 + 文件尾 APPEND fallback"
+          #  两道兜底，所以这里 cache 重复塞不碍事）
           cmake -S . -B build -G Ninja \
             -DTARGET_ARCH=i686 \
             -DCMAKE_INSTALL_PREFIX="" \
             -DALWAYS_REMOVE_BUILD_DIRS=ON \
-            -DMPV_RELEASE_SOURCE_DIR="$MPV_SRC_WIN" \
-            -DMPV_SOURCE_DIR="$MPV_SRC_WIN" \
-            -DMPV_RELEASE_URL="" \
-            -DMPV_RELEASE_GIT_REPOSITORY="" \
-            -DMPV_RELEASE_GIT_TAG="" \
-            -DMPV_SRC="$MPV_SRC_WIN" \
+            -DSINGLE_SOURCE_LOCATION="$PARENT_WIN" \
             -DFFMPEG_EXTRA_OPTIONS="--disable-openssl;--enable-schannel;--disable-gnutls;--disable-mbedtls;--disable-libtls" \
             -DFFMPEG_ADDITIONAL_CONFIGURE_FLAGS="--disable-openssl;--enable-schannel;--disable-gnutls;--disable-mbedtls;--disable-libtls" \
-            -DFFMPEG_CONFIGURE_EXTRA_FLAGS="--disable-openssl;--enable-schannel;--disable-gnutls;--disable-mbedtls;--disable-libtls" \
-            -DFFMPEG_EXTRA_CONFIGURE_ARGS="--disable-openssl;--enable-schannel;--disable-gnutls;--disable-mbedtls;--disable-libtls" \
             -DMPV_EXTRA_OPTIONS="-Dopenssl=disabled;-Dtls-backend=schannel" \
-            -DMPV_EXTRA_MESON_OPTIONS="-Dopenssl=disabled;-Dtls-backend=schannel" \
-            -DMPV_ADDITIONAL_MESON_FLAGS="-Dopenssl=disabled;-Dtls-backend=schannel" \
-            -DMPV_MESON_EXTRA_FLAGS="-Dopenssl=disabled;-Dtls-backend=schannel"
+            -DMPV_ADDITIONAL_MESON_FLAGS="-Dopenssl=disabled;-Dtls-backend=schannel"
           echo "---- cmake cache top-entries ----"
-          cmake -L -N build | head -n 100
-          echo "---- grep cache for mpv / ffmpeg key ----"
-          grep -iE "MPV_RELEASE|MPV_SRC|MPV_SOURCE|FFMPEG|MPV_EXTRA|openssl|schannel" build/CMakeCache.txt 2>/dev/null | head -n 60 || true
+          cmake -L -N build | head -n 120
+          echo "---- grep cache for SINGLE / openssl / schannel / ffmpeg / mpv key ----"
+          grep -iE "SINGLE_SOURCE_LOCATION|MPV_RELEASE|MPV_SRC|MPV_SOURCE|FFMPEG|MPV_EXTRA|openssl|schannel" \
+            build/CMakeCache.txt 2>/dev/null | head -n 80 || true
+          echo "---- if SINGLE_SOURCE_LOCATION above is non-empty, we're good ----"
 
       # -------- 跑 ninja。预计 2-4 小时。 --------
       - name: Build (ninja superbuild)
