@@ -79,7 +79,7 @@ def patch_mpv_release(text: str) -> str:
     #         Note: re.S => "." matches newlines too.  The non-greedy .*? stops at the first
     #               OUTPUT_VARIABLE LINK ) it sees, which is exactly the block we want.
     out = re.sub(
-        r"(?mS)^file\s*\(\s*WRITE\s+\$\{PREFIX_DIR\}/get_latest_tag\.sh\b"
+        r"(?ms)^file\s*\(\s*WRITE\s+\$\{PREFIX_DIR\}/get_latest_tag\.sh\b"
         r".*?"
         r"execute_process\s*\([^)]*\bOUTPUT_VARIABLE\s+LINK\b[^)]*\)\s*\n",
         "# --- [v12.2 CI] get_latest_tag / curl-GitHub-API / URL=${LINK} block disabled\n"
