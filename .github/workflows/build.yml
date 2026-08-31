@@ -10,55 +10,115 @@
       - "name": "Checkout"
         "uses": "actions/checkout@v4"
 
-      - "name": "Setup MSYS2 base (MINGW32) WITHOUT installing any packages via action params"
+      - "name": "Setup MSYS2 MINGW32 (let the action itself do step-1 pacman -Syu via update:true)"
         "uses": "msys2/setup-msys2@v2"
         "with":
           "msystem": "MINGW32"
-          "update": false
+          # KEY: 开启 action 内建的 update:true → 它内部会正确处理 "需要重启 shell 的 pacman 升级"
+          "update": true
+          # 不再在这里装任何包,避免 pacboy expansion bug 与 install 阶段的冲突
           "install": ""
 
-      - "name": "Step 1 - Refresh pacman DB twice (first one may update pacman itself; both needed)"
+      - "name": "Print env + prepare pacman DB (refresh only, no upgrade loop)"
         "shell": "msys2 {0}"
-        "run": "set -e; echo \"[MINGW_PACKAGE_PREFIX] $MINGW_PACKAGE_PREFIX\"; echo \"[CC] $CC\"; echo \"[MSYSTEM] $MSYSTEM\"; echo '--- pacman -Syu #1 (might exit 254 to restart, ignore) ---'; pacman -Syu --noconfirm --disable-download-timeout 2>&1 | tail -n 20 || true; echo '--- pacman -Syu #2 (post-restart) ---'; pacman -Syu --noconfirm --disable-download-timeout 2>&1 | tail -n 40"
+        "run": |
+          # IMPORTANT: do NOT use `set -e` for this whole step because:
+          #   - pacman -Sy may exit non-0 on transient mirror errors
+          #   - pacman lock file left by the action's internal -Syu is harmless after clearing
+          set +e
+          echo "============================================================"
+          echo "[MINGW_PACKAGE_PREFIX] $MINGW_PACKAGE_PREFIX"
+          echo "[MSYSTEM]              $MSYSTEM"
+          echo "[PATH head]            $(echo $PATH | tr ':' '\n' | head -n 10 | tr '\n' ' ')"
+          echo "============================================================"
 
-      - "name": "Step 2 - Install ALL build deps (using $MINGW_PACKAGE_PREFIX to avoid pacboy expansion bugs)"
+          echo "--- 1) Clear stale pacman lock ---"
+          rm -f /var/lib/pacman/db.lck /var/lib/pacman/db.lck.broken
+          ls -la /var/lib/pacman/ | head
+
+          echo "--- 2) Pacman version + arch ---"
+          pacman --version | head -n 3
+          uname -a
+
+          echo "--- 3) Refresh package databases only (NOT upgrade world) [pacman -Sy] ---"
+          pacman -Sy --noconfirm --disable-download-timeout 2>&1 | tail -n 15
+          rc_refresh=$?
+          echo "[rc=$rc_refresh] (0=ok, anything else see above)"
+
+          echo "--- 4) How many ${MINGW_PACKAGE_PREFIX}* packages can pacman see right now? ---"
+          total=$(pacman -Sl 2>/dev/null | grep -c "^mingw32 ${MINGW_PACKAGE_PREFIX}" || echo 0)
+          echo "[Seen in repo] $total i686 packages"
+
+          echo "--- 5) Search: is ffmpeg actually there? ---"
+          hit=$(pacman -Ss "^${MINGW_PACKAGE_PREFIX}ffmpeg$" 2>/dev/null | head -n 3 || echo "")
+          if [ -n "$hit" ]; then
+            echo "FOUND $hit"
+            ENV_OK=1
+          else
+            echo "NOT FOUND. Trying broader search:"
+            pacman -Ss ffmpeg 2>/dev/null | grep '^mingw32/' | head -n 10
+            echo ""
+            echo "*** Fallback: attempt pacman -Syy (force refresh all dbs from scratch) ***"
+            pacman -Syy --noconfirm --disable-download-timeout 2>&1 | tail -n 15 || true
+            hit2=$(pacman -Ss "^${MINGW_PACKAGE_PREFIX}ffmpeg$" 2>/dev/null | head -n 3 || echo "")
+            if [ -n "$hit2" ]; then
+              echo "NOW FOUND after -Syy: $hit2"
+              ENV_OK=1
+            else
+              echo "STILL NOT FOUND. Aborting build so we can diagnose repos."
+              echo "=== pacman.conf repos ==="
+              grep -E '^\s*\[|\s*Server\s*=' /etc/pacman.conf /etc/pacman.d/*.repo 2>/dev/null | head -n 50
+              exit 4
+            fi
+          fi
+          echo "=== env/pacman DB ready ==="
+
+      - "name": "Install ALL build deps (prefix = ${MINGW_PACKAGE_PREFIX})"
         "shell": "msys2 {0}"
         "run": |
           set -e
           PFX="$MINGW_PACKAGE_PREFIX"
           echo "[Using prefix] $PFX"
-          echo "--- Example resolved package names ---"
-          for p in toolchain meson pkgconf nasm ffmpeg libass libjpeg-turbo libbluray libdvdnav shaderc spirv-cross lcms2 libarchive mujs vulkan-loader angle-library libplacebo vulkan-headers; do
-            echo "  ${PFX}${p}"
-          done
-          echo "--- Pacman -Sl: how many ${PFX}* packages are in the repos? ---"
-          pacman -Sl 2>/dev/null | grep -c "^mingw32 ${PFX}" || echo "0 (mirror not ready)"
-          echo "--- Install ---"
-          pacman -S --noconfirm --needed --disable-download-timeout \
-            ${PFX}toolchain \
-            ${PFX}meson \
-            ${PFX}pkgconf \
-            ${PFX}nasm \
-            ${PFX}ffmpeg \
-            ${PFX}libass \
-            ${PFX}libjpeg-turbo \
-            ${PFX}libbluray \
-            ${PFX}libdvdnav \
-            ${PFX}libdvdread \
-            ${PFX}libdvdcss \
-            ${PFX}shaderc \
-            ${PFX}spirv-cross \
-            ${PFX}lcms2 \
-            ${PFX}libarchive \
-            ${PFX}mujs \
-            ${PFX}vulkan-loader \
-            ${PFX}angle-library \
-            ${PFX}libplacebo \
-            ${PFX}vulkan-headers \
-            2>&1 | tail -n 80
-          echo "--- Verify installed ---"
+
+          PKGS=(
+            "toolchain"
+            "meson"
+            "pkgconf"
+            "nasm"
+            "ffmpeg"
+            "libass"
+            "libjpeg-turbo"
+            "libbluray"
+            "libdvdnav"
+            "libdvdread"
+            "libdvdcss"
+            "shaderc"
+            "spirv-cross"
+            "lcms2"
+            "libarchive"
+            "mujs"
+            "vulkan-loader"
+            "angle-library"
+            "libplacebo"
+            "vulkan-headers"
+          )
+          FULL_PKGS=()
+          for p in "${PKGS[@]}"; do FULL_PKGS+=("${PFX}${p}"); done
+
+          echo "=== Packages to install ==="
+          printf '  %s\n' "${FULL_PKGS[@]}"
+          echo "=========================="
+
+          set +e
+          pacman -S --noconfirm --needed --disable-download-timeout "${FULL_PKGS[@]}" 2>&1 | tail -n 80
+          rc=$?
+          set -e
+          echo "[pacman -S exit code] $rc"
+
+          # allow exit 1 from optional packages (e.g. libdvdcss not in this mirror); verify the MUST ones
+          echo "=== Post-install verify: the MUST-HAVE packages ==="
           miss=0
-          for p in ffmpeg libass libbluray libdvdnav libdvdread shaderc angle-library libplacebo; do
+          for p in ffmpeg libass libbluray libdvdnav libdvdread shaderc libplacebo meson pkgconf; do
             full="${PFX}${p}"
             if pacman -Qs "^${full}$" >/dev/null 2>&1; then
               echo "  OK     $full"
@@ -68,35 +128,35 @@
             fi
           done
           if [ "$miss" -gt 0 ]; then
-            echo "!!! $miss core dependencies missing, dumping package counts !!!"
-            pacman -Sl 2>/dev/null | grep '^mingw32' | wc -l
-            echo "Top packages similar to search query ffmpeg:"
-            pacman -Ss ffmpeg 2>/dev/null | grep '^mingw32/' | head -n 10 || true
+            echo "!!! $miss mandatory packages still missing !!!"
+            echo "Top search results for each missing package:"
+            for p in ffmpeg libass libbluray libdvdnav libdvdread shaderc libplacebo meson pkgconf; do
+              echo "--- $p ---"
+              pacman -Ss "$p" 2>/dev/null | grep '^mingw32/' | head -n 5 || true
+            done
             exit 3
           fi
-          echo "All core deps installed."
-          pkg-config --exists libavcodec  && echo "[pkg-config] libavcodec: YES $(pkg-config --modversion libavcodec)" || echo "[pkg-config] libavcodec: NO"
-          pkg-config --exists libbluray   && echo "[pkg-config] libbluray: YES"  || echo "[pkg-config] libbluray: NO"
-          pkg-config --exists dvdnav       && echo "[pkg-config] dvdnav: YES"      || echo "[pkg-config] dvdnav: NO"
+          echo "All mandatory packages are present."
+          echo ""
+          pkg-config --exists libavcodec  && echo "[pkg-config] libavcodec  YES $(pkg-config --modversion libavcodec)"  || echo "[pkg-config] libavcodec  NO"
+          pkg-config --exists libbluray   && echo "[pkg-config] libbluray   YES"                                  || echo "[pkg-config] libbluray   NO"
+          pkg-config --exists dvdnav       && echo "[pkg-config] dvdnav       YES"                                  || echo "[pkg-config] dvdnav       NO"
+          pkg-config --exists shaderc      && echo "[pkg-config] shaderc      YES"                                  || echo "[pkg-config] shaderc      NO"
+          meson --version | awk '{print "[meson version] " $0}'
+          which gcc && gcc --version | head -n 1 || echo "[gcc] NOT FOUND"
 
-      - "name": "Clone LATEST mpv v0.41.0 + print its TRUE meson option names (source of truth for this version)"
+      - "name": "Clone mpv v0.41.0 and dump its REAL meson option names"
         "shell": "msys2 {0}"
         "run": |
           set -e
           rm -rf mpv
-          echo ">>> Cloning mpv v0.41.0 ..."
           git clone --depth 1 --branch v0.41.0 https://github.com/mpv-player/mpv.git mpv
           cd mpv
-          echo ">>> Version reported by ./version.py:"
-          ./version.py 2>/dev/null || echo "(not reported)"
-          echo ">>> meson_options.txt: option names we really care about:"
-          grep -E '^option\s*\(' meson_options.txt | head -n 1 | cat -n
-          echo "---"
+          echo "=== mpv tag v0.41.0; its supported meson options we care about ==="
           awk '/^option\(/ {
             match($0, /^option\(\s*"([^"]+)"/, a)
             if (a[1] != "") print a[1]
           }' meson_options.txt | grep -Ei "tls|openssl|angle|egl|pthread|win32|jpeg|sdl|libplacebo|lcms|archive|libmpv|cplayer|dvdnav|dvdread|bluray|ffmpeg|libass|lua|javascript|vulkan|iconv" | sort -u
-          echo "--- (all above is the EXACT option names v0.41.0 accepts, not guesses)"
 
       - "name": "Configure meson"
         "shell": "msys2 {0}"
@@ -134,7 +194,7 @@
           if [ $rc -ne 0 ]; then
             echo "=== meson setup FAILED, tail log ==="
             if [ -f build/meson-logs/meson-log.txt ]; then tail -n 150 build/meson-logs/meson-log.txt; else echo "(no meson-log.txt)"; fi
-            echo "=== Re-check what option names this mpv actually supports ==="
+            echo "=== True option names this mpv accepts ==="
             awk '/^option\(/ { match($0, /^option\(\s*"([^"]+)"/, a); if (a[1] != "") print a[1] }' meson_options.txt | sort -u
             exit $rc
           fi
@@ -157,9 +217,8 @@
             meson compile -C build --verbose 2>&1 | tail -n 220
             exit $rc
           fi
-          echo "=== Build output files ==="
+          echo "=== Build outputs ==="
           ls -la build/libmpv* 2>/dev/null
-          echo "=== ldd / import check ==="
           (ldd build/libmpv-2.dll || true) 2>/dev/null | head -n 30
 
       - "name": "Collect artifacts"
@@ -169,7 +228,7 @@
           rm -rf output
           mkdir -p output/include
           if [ ! -f mpv/build/libmpv-2.dll ]; then
-            echo "!!! libmpv-2.dll not built, listing build dir !!!"
+            echo "!!! libmpv-2.dll not built !!!"
             ls -la mpv/build/
             exit 2
           fi
@@ -186,7 +245,7 @@
           fi
           echo "=== Final artifacts ==="
           ls -la
-          echo "Total: $(find . -type f | wc -l) files"
+          echo "Total files: $(find . -type f | wc -l)"
 
       - "name": "Upload artifacts"
         "if": "always()"
