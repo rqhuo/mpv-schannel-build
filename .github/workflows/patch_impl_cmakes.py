@@ -491,15 +491,26 @@ def patch_execute_process(text: str, filename_for_context: str = "<unknown>") ->
                     scan_pos = end_b
                 # Advance text cursor to scan_pos so outer loop doesn't re-parse.
                 j = scan_pos
-                if argv and not first_token_is_safe_pe(argv[0]):
-                    shell_str = bash_recompose(argv)
-                    out.append(" bash -lc ")
-                    escaped = shell_str.replace("\\", "\\\\").replace('"', '\\"')
-                    out.append(f'"{escaped}"')
+                # v12.8: "one size fits all" strategy.  For every impl.cmake
+                # that is NOT already short-circuited by Strategy 1 (i.e.
+                # *not* a download/update/postremovebuild/removebuild step),
+                # the COMMAND was written by upstream superbuild for an
+                # MSYS2/bash-compatible shell.  It may contain cd / && /
+                # VAR=value prefixes / autotools `configure` scripts without
+                # extension / redirections.  Even if the first token LOOKS
+                # like a safe PE (cmake / ninja / .exe), wrapping it with
+                # `bash -lc` is semantically a no-op (bash still finds the
+                # same PE on PATH) and costs ~20 ms — a tiny price to close
+                # every "CreateProcess cannot run shell script / builtin"
+                # leak forever.  So we simply ALWAYS wrap here.
+                if not argv:
+                    # execute_process(COMMAND) with zero args → leave alone.
                     continue
-                else:
-                    out.append(" " + " ".join(argv))
-                    continue
+                shell_str = bash_recompose(argv)
+                out.append(" bash -lc ")
+                escaped = shell_str.replace("\\", "\\\\").replace('"', '\\"')
+                out.append(f'"{escaped}"')
+                continue
             # Any non-COMMAND, non-() keyword — copy verbatim
             out.append(tok)
             j = k
