@@ -237,7 +237,18 @@ def patch_execute_process(text: str) -> str:
     # We search case-insensitively (CMake is case-insensitive for keywords) but
     # all upstream impl.cmake use lowercase execute_process.
     pattern = re.compile(r"execute_process\s*\(", re.IGNORECASE)
+    safety_iter = 0
+    MAX_ITER = max(4, len(text) * 2)  # sanity cap against future bugs → break
     while i < n:
+        safety_iter += 1
+        if safety_iter > MAX_ITER:
+            # This should never happen with correct i-pointer advancement.  If
+            # it does, bail out and return the *original* text untouched for
+            # this file (better than infinite loop / OOM).
+            sys.stderr.write(
+                f"[patch_impl_cmakes:SAFETY] exceeded {MAX_ITER} outer-loop iters "
+                f"(text_len={n}, i={n}); returning unpatched to avoid OOM.\n")
+            return text
         m = pattern.search(text, i)
         if not m:
             out.append(text[i:])
@@ -248,14 +259,10 @@ def patch_execute_process(text: str) -> str:
         paren_open_pos = m.end() - 1
         # Write "execute_process(" verbatim
         out.append(text[m.start():m.end()])
-        # Now we're INSIDE execute_process(...). Parse lineary to find all
+        # Now we're INSIDE execute_process(...). Parse linearly to find all
         # COMMAND <tokens> <stop_word_or_next_COMMAND_or_paren_end>.
         j = m.end()
         paren_depth = 1
-        # We'll build a new body of execute_process args, rewriting COMMAND
-        # clauses as we go.
-        depth_delta_on_close = 0
-        last_was_command_keyword = False
         while j < n and paren_depth > 0:
             c = text[j]
             if c.isspace():
@@ -303,9 +310,7 @@ def patch_execute_process(text: str) -> str:
                 while j < n and text[j].isspace():
                     out.append(text[j])
                     j += 1
-                # Collect argv tokens until stop word or boundary. Use the
-                # same tokenizer loop but do NOT write anything yet — we
-                # decide first whether to rewrite.
+                # Collect argv tokens until stop word or boundary.
                 argv = []
                 scan_pos = j
                 while scan_pos < n:
@@ -340,37 +345,31 @@ def patch_execute_process(text: str) -> str:
                         break
                     argv.append(bword)
                     scan_pos = end_b
-                # Now `scan_pos` is positioned at the char after the argv
-                # tokens end (or first stop-word char). We need to advance
-                # text-scan `j` past all chars of argv tokens so the main
-                # outer loop doesn't double-process them.
+                # Advance text cursor to scan_pos so outer loop doesn't re-parse.
                 j = scan_pos
                 if argv and not first_token_is_safe_pe(argv[0]):
-                    # Wrap this COMMAND argv through bash -lc
                     shell_str = bash_recompose(argv)
-                    # Produce:   bash -lc "<shell>"
-                    # bash -lc uses the *next* arg as $0 if given args after
-                    # the command string, which is fine — we don't need args
-                    # here because we already re-quoted them inline.
                     out.append(" bash -lc ")
-                    # CMake-style quote the full shell string.
                     escaped = shell_str.replace("\\", "\\\\").replace('"', '\\"')
                     out.append(f'"{escaped}"')
-                    # (j already moved to scan_pos, skip old argv below)
                     continue
                 else:
-                    # argv[0] safe: emit the original argv tokens verbatim so
-                    # we don't risk any quoting regression. We don't need to
-                    # reconstruct them from `argv` because they're still in
-                    # `text` between original `j_before_argv` and scan_pos.
-                    # But we lost that j_before_argv because we used j
-                    # directly. So reconstruct: copy from earliest j_before
-                    # which is ... we don't have it. Easier: write argv out.
                     out.append(" " + " ".join(argv))
                     continue
             # Any non-COMMAND, non-() keyword — copy verbatim
             out.append(tok)
             j = k
+        # =====================================================================
+        # CRITICAL POINTER ADVANCE (v12.5 — fixes the v12.4 OOM bug).
+        # The inner j-loop above has fully parsed one execute_process(…) and
+        # `j` now points *immediately after* its closing ')'.  We MUST set the
+        # outer search pointer `i = j` here; otherwise the next
+        # pattern.search(text, i) call starts from *before* this same block
+        # and re-finds the same "execute_process(" token — we'd append it yet
+        # again, forever, growing `out` without bound until the runner OOMs
+        # at ~2-3 minutes (exactly the stack trace the user pasted).
+        # =====================================================================
+        i = j
     return "".join(out)
 
 
@@ -385,28 +384,45 @@ def main() -> int:
     # Find every --impl.cmake file ever generated anywhere under build/
     count_patched = 0
     count_seen = 0
-    for p in sorted(build_dir.rglob("*--impl.cmake")):
+    count_skipped = 0
+    all_files = list(sorted(build_dir.rglob("*--impl.cmake")))
+    print(f"scanning {len(all_files)} candidate *--impl.cmake files under {build_dir}")
+    for p in all_files:
         if not p.is_file():
             continue
         count_seen += 1
+        src = None
         try:
-            src = p.read_text(encoding="utf-8", errors="replace")
+            # Most impl.cmake files are tiny (<= 4 KB).  Read as binary to avoid
+            # any BOM / non-utf8 bytes crashing the batch; decode with replace.
+            raw = p.read_bytes()
+            src = raw.decode("utf-8", errors="replace")
         except OSError as e:
-            print(f"[WARN] cannot read {p}: {e}", file=sys.stderr)
+            print(f"[SKIP:read] {p}: {e}", file=sys.stderr)
+            count_skipped += 1
             continue
         if "execute_process" not in src:
             continue
-        dst = patch_execute_process(src)
+        try:
+            dst = patch_execute_process(src)
+        except Exception as e:
+            # Never let a single malformed impl.cmake kill the whole build.
+            print(f"[SKIP:parse] {p}: {type(e).__name__}: {e}", file=sys.stderr)
+            count_skipped += 1
+            continue
         if dst != src:
             try:
-                p.write_text(dst, encoding="utf-8")
+                # Write via bytes to avoid Windows newlines mangling CMake args.
+                p.write_bytes(dst.encode("utf-8"))
             except OSError as e:
-                print(f"[WARN] cannot write {p}: {e}", file=sys.stderr)
+                print(f"[SKIP:write] {p}: {e}", file=sys.stderr)
+                count_skipped += 1
                 continue
             count_patched += 1
-            print(f"   patched: {p.relative_to(build_dir).as_posix()}")
+            rel = p.relative_to(build_dir).as_posix()
+            print(f"   patched: {rel}")
     print(f"\nDONE patch_impl_cmakes.py: scanned {count_seen} *--impl.cmake files, "
-          f"patched COMMAND in {count_patched} of them.")
+          f"patched COMMAND in {count_patched}, skipped {count_skipped}.")
     return 0
 
 
