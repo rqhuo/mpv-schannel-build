@@ -17,6 +17,12 @@ v16 fixes:
     packages (not just whitelisted). These steps delete build dirs and
     lose compiled DLLs before copy-binary can run.
 
+v16.2 fixes:
+  - Fix is_rescue_step: use basename comparison instead of endswith
+    (path ends with /mpv-build, not -mpv-build)
+  - Add copy-package-dir, fullclean, liteclean, delete-dir to
+    SKIP_VIA_TOUCH_STEPS (these delete build dirs or fail on impl.cmake)
+
 Usage:  python patch_build_ninja.py <build_dir>
 """
 import re
@@ -52,8 +58,9 @@ UNIVERSAL_SKIP_STEPS = ["removebuild", "postremovebuild"]
 
 # V16.1: Steps to skip via touch (non-whitelisted but cause failures)
 # mpv-copy-binary fails because mpv-package/ dir doesn't exist.
-# DLL is already rescued by RESCUE_AFTER_BUILD, so just touch the stamp.
-SKIP_VIA_TOUCH_STEPS = ["copy-binary"]
+# mpv-copy-package-dir fails because impl.cmake has shell commands.
+# fullclean/liteclean/delete-dir may delete build dirs with our DLLs.
+SKIP_VIA_TOUCH_STEPS = ["copy-binary", "copy-package-dir", "fullclean", "liteclean", "delete-dir"]
 
 # V16.1: After these build steps complete, immediately copy DLL to rescue dir.
 # Key insight: mpv-build generates libmpv-2.dll, but some later step may
@@ -128,8 +135,9 @@ def is_rescue_step(outputs):
     else None."""
     for out in outputs:
         out_norm = out.replace('\\', '/')
+        basename = out_norm.split('/')[-1]
         for step_name in RESCUE_AFTER_BUILD:
-            if out_norm.endswith('-' + step_name):
+            if basename == step_name:
                 return step_name
     return None
 
@@ -301,6 +309,6 @@ while i < n:
 with open(NINJA_FILE, 'w', encoding='utf-8', newline='\n') as f:
     f.writelines(new_lines)
 
-print(f"v16.1 patch_build_ninja.py: patched {patched} build rule COMMANDs -> cmake -E touch chain")
-print(f"v16.1 patch_build_ninja.py: RERUN_CMAKE disabled = {rerun_patched}")
-print(f"v16.1 patch_build_ninja.py: file = {NINJA_FILE}")
+print(f"v16.2 patch_build_ninja.py: patched {patched} build rule COMMANDs -> cmake -E touch chain")
+print(f"v16.2 patch_build_ninja.py: RERUN_CMAKE disabled = {rerun_patched}")
+print(f"v16.2 patch_build_ninja.py: file = {NINJA_FILE}")
