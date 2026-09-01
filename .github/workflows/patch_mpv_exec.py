@@ -124,6 +124,36 @@ for stamp_dir in stamp_dirs:
                 content = content.replace(opt, '')
                 print(f"v18.1 REMOVED invalid option '{opt}' from {os.path.basename(cmake_file)}")
 
+        # V18.6: Disable pdf-build. llvm-libcxx (libc++) is frequently the
+        # first / earliest FAILED external step on the MSYS2 MINGW32 i686
+        # toolchain because its install step expects libc++ headers and
+        # runtime that have not been shipped / linked the way CMake's
+        # superbuild layout assumes. Even if we short-circuit llvm-libcxx
+        # stamps via patch_build_ninja.py whitelist so ninja doesn't abort
+        # the whole DAG, meson's pdf-build feature still probes for C++
+        # headers and may fail downstream. PDF rendering is a niche
+        # subtitle feature and completely unnecessary for Blu-ray / DVD
+        # playback (the user's end goal). Disable it to sever this
+        # dependency chain entirely.
+        #
+        # Python `re` doesn't support variable-width look-behind, so we
+        # do a plain regex match on `-Dpdf-build=<value>` with explicit
+        # separator chars allowed BEFORE and AFTER as capture groups, and
+        # re-emit the original separators unchanged.
+        pdf_build_re = re.compile(
+            r"([;\"'\s]|^)-Dpdf-build=(enabled|disabled|auto|true|false)([;\"'\s]|$)",
+        )
+        fixed_count = 0
+        def _count_and_fix(m):
+            nonlocal fixed_count
+            fixed_count += 1
+            before, _value, after = m.group(1), m.group(2), m.group(3)
+            return f"{before}-Dpdf-build=disabled{after}"
+        content_new = pdf_build_re.sub(_count_and_fix, content)
+        if content_new != content:
+            content = content_new
+            print(f"v18.6 FIXED pdf-build: set {fixed_count} occurrence(s) to disabled in {os.path.basename(cmake_file)} (llvm-libcxx dep removed)")
+
         # V18.3: Fix merged gl+egl-angle option.
         # On CI (logs_90887073920), meson sees:  '-Dgl=enabled -Degl-angle=enabled'
         # i.e. a SINGLE shell-quoted argument with embedded space, causing

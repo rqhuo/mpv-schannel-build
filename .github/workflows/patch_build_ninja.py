@@ -63,6 +63,16 @@ WHITELIST_PKGS = [
     "shaderc", "opus", "bzip2", "libmodplug",
     # Tier 2: prophylactic (3)
     "xvidcore", "x265-10bit-lib", "x265-12bit-lib",
+    # Tier 2b: logs_90928839563 NEW confirmed FAILED — abort the
+    # entire DAG if any of these fail (ninja: cannot make progress
+    # due to previous errors), so short-circuit them to touch:
+    #   * llvm-libcxx  -> only required for "-Dpdf-build=enabled"
+    #                    (PDF subtitle rendering). We disable pdf-build
+    #                    via mpv configure as well; safe to skip.
+    #   * x265-8+10bit / x265-8+10+12bit -> optional multi-bit-depth
+    #                    x265 binaries. Default 8-bit x265 builds and
+    #                    installs fine; ffmpeg only needs the 8-bit one.
+    "llvm-libcxx", "x265-8+10bit", "x265-8+10+12bit",
     # Tier 3: Vulkan/shader stack (8)
     "shaderc-utils", "spirv-cross", "glslang", "spirv-tools",
     "spirv-headers", "spirv-header", "vulkan-headers", "vulkan-header",
