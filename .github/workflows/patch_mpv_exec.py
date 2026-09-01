@@ -124,21 +124,59 @@ for stamp_dir in stamp_dirs:
                 content = content.replace(opt, '')
                 print(f"v18.1 REMOVED invalid option '{opt}' from {os.path.basename(cmake_file)}")
 
-        # V18.2: Fix improperly quoted gl+egl-angle merged by cmake semicolons:
-        #   '-Dgl=enabled -Degl-angle=enabled'  =>  '-Dgl=enabled;-Degl-angle=enabled'
-        # Reason: ExternalProject writes the meson argument list as a
-        # semicolon-separated string; cmake then re-joins with spaces on
-        # the command line, causing the two options to look like ONE value
-        # with embedded quote. Meson sees gl="enabled -Degl-angle=enabled".
-        merged_gl_pattern = re.compile(
-            r"(['\"])-Dgl=(enabled|disabled|auto)\s+-Degl-angle=(enabled|disabled|auto)(['\"])"
+        # V18.3: Fix merged gl+egl-angle option.
+        # On CI (logs_90887073920), meson sees:  '-Dgl=enabled -Degl-angle=enabled'
+        # i.e. a SINGLE shell-quoted argument with embedded space, causing
+        # meson to parse gl="enabled -Degl-angle=enabled" (invalid choice).
+        #
+        # Two-step fix:
+        #   FORM-A : cmake list element is explicitly shell-quoted:
+        #            ;'-Dgl=<x> -Degl-angle=<y>'   (or ;"OPT1 OPT2")
+        #            Fix: remove quotes, split with semicolon:
+        #            ;-Dgl=<x>;-Degl-angle=<y>
+        #   FORM-B : residual space-joined WITHOUT any quotes:
+        #            -Dgl=<x> -Degl-angle=<y>
+        #            Fix: insert semicolon between:
+        #            -Dgl=<x>;-Degl-angle=<y>
+        # Already-correct (;-Dgl=<x>;-Degl-angle=<y>) form is never rewritten.
+
+        # --- Step 1: FORM-A (shell-quoted merged element)
+        merged_gl_quote = re.compile(
+            r";(['\"])(-Dgl=(enabled|disabled|auto)) (-Degl-angle=(enabled|disabled|auto))\1"
         )
-        def fix_gl_quote(m):
-            return f'{m.group(1)}-Dgl={m.group(2)};-Degl-angle={m.group(3)}{m.group(4)}'
-        content_gl = merged_gl_pattern.sub(fix_gl_quote, content)
-        if content_gl != content:
-            print(f"v18.2 FIXED merged gl+egl-angle quoting in {os.path.basename(cmake_file)}")
-            content = content_gl
+        matches_a = merged_gl_quote.findall(content)
+        if matches_a:
+            def fix_form_a(m):
+                return f';{m.group(2)};{m.group(4)}'
+            content = merged_gl_quote.sub(fix_form_a, content)
+            print(f"v18.3 FIXED merged gl+egl-angle FORM-A (quoted element) in {os.path.basename(cmake_file)}: {len(matches_a)} occurrence(s)")
+
+        # --- Step 2: FORM-B (space-joined, no quotes)
+        merged_plain = re.compile(
+            r"(-Dgl=(enabled|disabled|auto)) (-Degl-angle=(enabled|disabled|auto))"
+        )
+        matches_b = merged_plain.findall(content)
+        if matches_b:
+            def fix_form_b(m):
+                return f'{m.group(1)};{m.group(3)}'
+            new_content = merged_plain.sub(fix_form_b, content)
+            if new_content != content:
+                content = new_content
+                print(f"v18.3 FIXED merged gl+egl-angle FORM-B (space-joined) in {os.path.basename(cmake_file)}: {len(matches_b)} occurrence(s)")
+
+        # --- Diagnostics: show current gl/egl-angle tokens for visual confirmation
+        gl_diag_re = re.compile(r"[^;]*(?:gl|egl-angle)[^;\"]*", re.IGNORECASE)
+        diags = list(set(gl_diag_re.findall(content)))
+        snippets = []
+        for d in diags:
+            d = d.strip("\"' ")
+            if d and ('gl' in d.lower() or 'egl' in d.lower()):
+                snippets.append(d)
+        if snippets:
+            short = ' | '.join(snippets)
+            if len(short) > 260:
+                short = short[:260] + '...'
+            print(f"v18.3 DIAG: gl/egl-angle tokens in {os.path.basename(cmake_file)}: {short}")
 
         if content != original_content:
             with open(cmake_file, 'w', encoding='utf-8', newline='\n') as f:
