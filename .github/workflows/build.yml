@@ -484,6 +484,31 @@ jobs:
             grep -n -B1 -A12 "${key}" "$SB/build/build.ninja" 2>/dev/null | head -n 15 || echo "(no stamp $key found)"
           done
 
+      # -------- V18: bypass broken build/exec PE32 wrapper --------
+      # exec_wrapper.c compiles to PE32 but _spawnvp("bash") fails
+      # silently in cmake execute_process context (exit 0, 0-byte logs).
+      # patch_mpv_exec.py writes mpv_run.sh and patches all mpv/mpv-release
+      # configure-.cmake / build-.cmake to use "bash mpv_run.sh" instead
+      # of "build/exec".
+      - name: V18 Patch mpv exec (bypass broken build/exec PE32 wrapper)
+        run: |
+          set -e
+          SB="${GITHUB_WORKSPACE:-/c/trae}/mpv-winbuild"
+          python "$SB/../.github/workflows/patch_mpv_exec.py" "$SB/build"
+          echo "==== V18 verify: mpv_run.sh exists and is executable ===="
+          ls -la "$SB/build/mpv_run.sh"
+          echo "==== V18 verify: grep set(command in mpv configure-.cmake ===="
+          for f in mpv-configure-.cmake mpv-build-.cmake mpv-release-configure-.cmake mpv-release-build-.cmake; do
+            F="$(find "$SB/build" -name "$f" -print -quit 2>/dev/null || true)"
+            if [ -n "$F" ] && [ -s "$F" ]; then
+              echo "---- $f ----"
+              grep 'set(command' "$F" | head -c 300 || echo "(no set(command found)"
+              echo
+            else
+              echo "---- $f: NOT FOUND ----"
+            fi
+          done
+
       # -------- 跑 ninja。预计 2-4 小时。 --------
       - name: Build (ninja superbuild)
         run: |
