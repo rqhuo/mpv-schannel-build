@@ -105,6 +105,20 @@ for stamp_dir in stamp_dirs:
 
         content = exec_path_re.sub(replace_exec, content)
 
+        # V18.1: Remove meson options invalid for mpv v0.41.0
+        # - -Dopenssl=disabled : removed in v0.37+, TLS controlled by tls-backend only
+        # - -Dsubrandr=enabled : not available in v0.41.0
+        # These appear as semicolon-separated elements in the set(command) string
+        invalid_opts = [
+            ';-Dopenssl=disabled',
+            ';-Dsubrandr=enabled',
+            ';-Dsubrandr=disabled',
+        ]
+        for opt in invalid_opts:
+            if opt in content:
+                content = content.replace(opt, '')
+                print(f"v18.1 REMOVED invalid option '{opt}' from {os.path.basename(cmake_file)}")
+
         if content != original_content:
             with open(cmake_file, 'w', encoding='utf-8', newline='\n') as f:
                 f.write(content)
