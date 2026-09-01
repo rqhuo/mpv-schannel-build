@@ -98,11 +98,8 @@ for stamp_dir in stamp_dirs:
 
         # Find and replace the set(command "...build/exec...") line
         def replace_exec(match):
-            nonlocal patched_lines
-            full_match = match.group(0)
-            # Extract the part after build/exec
+            global patched_lines
             after_exec = match.group(2)  # e.g., ;CONF=1;meson;setup;..."
-            # Replace with: bash;MPV_RUN_SH;<rest>
             patched_lines += 1
             return f'set(command "bash;{MPV_RUN_SH}{after_exec}'
 
