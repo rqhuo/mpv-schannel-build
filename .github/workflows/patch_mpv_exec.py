@@ -106,18 +106,39 @@ for stamp_dir in stamp_dirs:
         content = exec_path_re.sub(replace_exec, content)
 
         # V18.1: Remove meson options invalid for mpv v0.41.0
-        # - -Dopenssl=disabled : removed in v0.37+, TLS controlled by tls-backend only
+        # - -Dopenssl=disabled : removed in v0.37+
         # - -Dsubrandr=enabled : not available in v0.41.0
-        # These appear as semicolon-separated elements in the set(command) string
+        # - -Dtls-backend=...  : unknown in v0.41.0 meson options for plain mpv
         invalid_opts = [
             ';-Dopenssl=disabled',
             ';-Dsubrandr=enabled',
             ';-Dsubrandr=disabled',
+            ';-Dtls-backend=schannel',
+            ';-Dtls-backend=openssl',
+            ';-Dtls-backend=gnutls',
+            ';-Dtls-backend=auto',
+            ';-Dtls-backend=disabled',
         ]
         for opt in invalid_opts:
             if opt in content:
                 content = content.replace(opt, '')
                 print(f"v18.1 REMOVED invalid option '{opt}' from {os.path.basename(cmake_file)}")
+
+        # V18.2: Fix improperly quoted gl+egl-angle merged by cmake semicolons:
+        #   '-Dgl=enabled -Degl-angle=enabled'  =>  '-Dgl=enabled;-Degl-angle=enabled'
+        # Reason: ExternalProject writes the meson argument list as a
+        # semicolon-separated string; cmake then re-joins with spaces on
+        # the command line, causing the two options to look like ONE value
+        # with embedded quote. Meson sees gl="enabled -Degl-angle=enabled".
+        merged_gl_pattern = re.compile(
+            r"(['\"])-Dgl=(enabled|disabled|auto)\s+-Degl-angle=(enabled|disabled|auto)(['\"])"
+        )
+        def fix_gl_quote(m):
+            return f'{m.group(1)}-Dgl={m.group(2)};-Degl-angle={m.group(3)}{m.group(4)}'
+        content_gl = merged_gl_pattern.sub(fix_gl_quote, content)
+        if content_gl != content:
+            print(f"v18.2 FIXED merged gl+egl-angle quoting in {os.path.basename(cmake_file)}")
+            content = content_gl
 
         if content != original_content:
             with open(cmake_file, 'w', encoding='utf-8', newline='\n') as f:
