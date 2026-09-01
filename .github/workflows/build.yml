@@ -483,7 +483,7 @@ jobs:
           RESCUE_DIR="$SB/build/rescue"
           mkdir -p "$RESCUE_DIR"
           (
-            for i in $(seq 1 7200); do  # 最多监控 2 小时 (7200 * 1s)
+            for i in $(seq 1 36000); do  # 最多监控 2 小时 (36000 * 0.2s)
               for src in \
                 "$SB/build/packages/mpv-prefix/src/mpv-build/libmpv-2.dll" \
                 "$SB/build/packages/mpv-release-prefix/src/mpv-release-build/libmpv-2.dll" \
@@ -500,7 +500,7 @@ jobs:
                   exit 0
                 fi
               done
-              sleep 1
+              sleep 0.2
             done
           ) &
           RESCUE_PID=$!
@@ -508,6 +508,13 @@ jobs:
 
           ninja -j3 -v -k 100 2>&1 | tee "$LOG" | tail -n 6000
           RC=${PIPESTATUS[0]:-$?}
+
+          # V16.1: sleep 2 before killing rescue monitor — give it time
+          # to complete its final check after mpv-build finishes.
+          # mpv-build typically completes in the last second of the ninja
+          # run, and the 0.2s polling interval may need one more cycle.
+          echo "==== ninja done (exit=$RC), waiting 2s for rescue monitor ===="
+          sleep 2
 
           # 停止救援监控
           kill $RESCUE_PID 2>/dev/null || true

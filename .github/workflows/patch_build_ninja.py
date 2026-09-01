@@ -50,6 +50,29 @@ WHITELIST_PKGS = [
 # - postremovebuild: post-cleanup after removebuild
 UNIVERSAL_SKIP_STEPS = ["removebuild", "postremovebuild"]
 
+# V16.1: Steps to skip via touch (non-whitelisted but cause failures)
+# mpv-copy-binary fails because mpv-package/ dir doesn't exist.
+# DLL is already rescued by RESCUE_AFTER_BUILD, so just touch the stamp.
+SKIP_VIA_TOUCH_STEPS = ["copy-binary"]
+
+# V16.1: After these build steps complete, immediately copy DLL to rescue dir.
+# Key insight: mpv-build generates libmpv-2.dll, but some later step may
+# delete it before the rescue monitor's 1-second polling interval catches it.
+# By appending cp directly to the build COMMAND, we copy the DLL the instant
+# it's created.
+RESCUE_AFTER_BUILD = {
+    "mpv-build": {
+        "dll": "packages/mpv-prefix/src/mpv-build/libmpv-2.dll",
+        "exe": "packages/mpv-prefix/src/mpv-build/mpv.exe",
+        "impla": "packages/mpv-prefix/src/mpv-build/libmpv.dll.a",
+    },
+    "mpv-release-build": {
+        "dll": "packages/mpv-release-prefix/src/mpv-release-build/libmpv-2.dll",
+        "exe": "packages/mpv-release-prefix/src/mpv-release-build/mpv.exe",
+        "impla": "packages/mpv-release-prefix/src/mpv-release-build/libmpv.dll.a",
+    },
+}
+
 # Build a regex that matches: <pkg>-stamp[/\<]pkg>-<step>
 def make_pkg_regex(pkg):
     esc = re.escape(pkg)
@@ -82,7 +105,8 @@ def parse_outputs(output_raw):
 
 def is_whitelisted_output(outputs):
     """Return True if ANY output matches a whitelisted package pattern,
-    OR if ANY output ends with a UNIVERSAL_SKIP_STEP (e.g. -removebuild)."""
+    OR if ANY output ends with a UNIVERSAL_SKIP_STEP (e.g. -removebuild),
+    OR if ANY output ends with a SKIP_VIA_TOUCH_STEP (e.g. -copy-binary)."""
     for out in outputs:
         out_norm = out.replace('\\', '/')
         # V16: check whitelist packages
@@ -90,13 +114,35 @@ def is_whitelisted_output(outputs):
             if regex.search(out_norm):
                 return True
         # V16: check universal skip steps (removebuild, postremovebuild)
-        # for ALL packages — these steps delete build dirs and lose our DLLs.
-        # Use simple endswith check to handle package names with dashes
-        # (e.g. x265-8+10bit-removebuild, gcc-binutils-removebuild)
         for step in UNIVERSAL_SKIP_STEPS:
             if out_norm.endswith('-' + step):
                 return True
+        # V16.1: check skip-via-touch steps (copy-binary)
+        for step in SKIP_VIA_TOUCH_STEPS:
+            if out_norm.endswith('-' + step):
+                return True
     return False
+
+def is_rescue_step(outputs):
+    """Return the rescue step name if ANY output matches RESCUE_AFTER_BUILD,
+    else None."""
+    for out in outputs:
+        out_norm = out.replace('\\', '/')
+        for step_name in RESCUE_AFTER_BUILD:
+            if out_norm.endswith('-' + step_name):
+                return step_name
+    return None
+
+def make_rescue_command(step_name):
+    """Build a cp chain that copies DLL + mpv.exe + libmpv.dll.a to rescue/."""
+    files = RESCUE_AFTER_BUILD[step_name]
+    cmds = ['mkdir -p rescue']
+    dest_map = {'dll': 'rescue/libmpv-2.dll', 'exe': 'rescue/mpv.exe', 'impla': 'rescue/libmpv.dll.a'}
+    for key in ('dll', 'exe', 'impla'):
+        path = files[key]
+        dest = dest_map[key]
+        cmds.append(f'cp -f "{path}" "{dest}" 2>/dev/null || true')
+    return ' && '.join(cmds)
 
 def make_touch_command(outputs):
     """Build a `cmake -E touch` chain for all outputs."""
@@ -171,6 +217,53 @@ while i < n:
             i += 1
             continue
 
+        # V16.1: Check if this is a rescue step (mpv-build / mpv-release-build)
+        # If so, append cp command to the END of the existing COMMAND to
+        # immediately copy DLL to rescue/ dir the instant it's compiled.
+        rescue_step = is_rescue_step(outputs)
+        if rescue_step:
+            rescue_cmd = make_rescue_command(rescue_step)
+            new_lines.append(line)
+            i += 1
+            found_command = False
+            while i < n:
+                bl = lines[i]
+                if bl.startswith('build ') or bl.startswith('rule ') or \
+                   (bl and not bl[0] in (' ', '\t') and not bl.startswith('#')):
+                    break
+
+                if bl.strip().startswith('COMMAND') or bl.strip().startswith('command'):
+                    # Read the full COMMAND (may span multiple lines with $)
+                    cmd_lines = [bl]
+                    i += 1
+                    while i < n and cmd_lines[-1].rstrip().endswith('$'):
+                        cmd_lines.append(lines[i])
+                        i += 1
+                    # Append rescue cp to the last line of COMMAND
+                    # Replace trailing $ on last line, then append our cp
+                    last_line = cmd_lines[-1]
+                    if last_line.rstrip().endswith('$'):
+                        # Remove $ and append rescue_cmd
+                        last_line = last_line.rstrip()[:-1]  # remove $
+                        last_line = last_line + f' && {rescue_cmd}\n'
+                    else:
+                        # Single line COMMAND — append before newline
+                        last_line = last_line.rstrip('\n') + f' && {rescue_cmd}\n'
+                    # Replace last line
+                    cmd_lines[-1] = last_line
+                    new_lines.extend(cmd_lines)
+                    patched += 1
+                    found_command = True
+                    break
+                else:
+                    new_lines.append(bl)
+                    i += 1
+
+            if not found_command:
+                new_lines.append(f'  COMMAND = {rescue_cmd}\n')
+                patched += 1
+            continue
+
         # v15.2: whitelist match if ANY output matches
         if is_whitelisted_output(outputs):
             new_lines.append(line)
@@ -208,6 +301,6 @@ while i < n:
 with open(NINJA_FILE, 'w', encoding='utf-8', newline='\n') as f:
     f.writelines(new_lines)
 
-print(f"v16 patch_build_ninja.py: patched {patched} build rule COMMANDs -> cmake -E touch chain")
-print(f"v16 patch_build_ninja.py: RERUN_CMAKE disabled = {rerun_patched}")
-print(f"v16 patch_build_ninja.py: file = {NINJA_FILE}")
+print(f"v16.1 patch_build_ninja.py: patched {patched} build rule COMMANDs -> cmake -E touch chain")
+print(f"v16.1 patch_build_ninja.py: RERUN_CMAKE disabled = {rerun_patched}")
+print(f"v16.1 patch_build_ninja.py: file = {NINJA_FILE}")
