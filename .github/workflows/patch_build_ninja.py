@@ -22,6 +22,8 @@ v16.2 fixes:
     (path ends with /mpv-build, not -mpv-build)
   - Add copy-package-dir, fullclean, liteclean, delete-dir to
     SKIP_VIA_TOUCH_STEPS (these delete build dirs or fail on impl.cmake)
+  - Fix rescue cp: wrap in bash -lc because cmd.exe doesn't understand
+    Unix commands (mkdir -p, cp -f)
 
 Usage:  python patch_build_ninja.py <build_dir>
 """
@@ -142,15 +144,19 @@ def is_rescue_step(outputs):
     return None
 
 def make_rescue_command(step_name):
-    """Build a cp chain that copies DLL + mpv.exe + libmpv.dll.a to rescue/."""
+    """Build a cp chain that copies DLL + mpv.exe + libmpv.dll.a to rescue/.
+    Uses bash -lc wrapper because ninja runs COMMAND via cmd.exe which
+    doesn't understand Unix commands like mkdir -p / cp."""
     files = RESCUE_AFTER_BUILD[step_name]
-    cmds = ['mkdir -p rescue']
     dest_map = {'dll': 'rescue/libmpv-2.dll', 'exe': 'rescue/mpv.exe', 'impla': 'rescue/libmpv.dll.a'}
+    cmds = ['mkdir -p rescue']
     for key in ('dll', 'exe', 'impla'):
         path = files[key]
         dest = dest_map[key]
         cmds.append(f'cp -f "{path}" "{dest}" 2>/dev/null || true')
-    return ' && '.join(cmds)
+    # Join into single bash -lc command to ensure Unix commands work
+    inner = ' && '.join(cmds)
+    return f'bash -lc \'{inner}\''
 
 def make_touch_command(outputs):
     """Build a `cmake -E touch` chain for all outputs."""
