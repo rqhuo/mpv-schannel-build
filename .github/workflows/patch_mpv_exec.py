@@ -203,3 +203,92 @@ for stamp_dir in stamp_dirs:
 
 print(f"v18 patch_mpv_exec.py: patched {patched_files} files, {patched_lines} set(command) lines")
 print(f"v18 mpv_run.sh = {MPV_RUN_SH}")
+
+# ---------------------------------------------------------------------------
+# V18.4: Fix meson_cross.txt — replace /bin/i686-gcc /bin/i686-g++ /bin/i686-ar
+# /bin/i686-strip etc with actual MSYS2 triplet: i686-w64-mingw32-<tool>.
+#
+# ROOT CAUSE (logs_90905341375):
+#   meson cross file writes `/bin/i686-gcc` as c/cpp compiler, but MSYS2
+#   doesn't provide that short name — the actual binary is
+#   /mingw32/bin/i686-w64-mingw32-gcc. Result: meson says
+#     "Detecting compiler via: `/bin/i686-gcc --version` -> Failed running
+#      '/bin/i686-gcc', binary or interpreter not executable."
+#   and meson setup aborts.
+#
+# We fix by rewriting any cross-file reference to the old short prefix
+# `/bin/i686-<tool>` to the full triplet `i686-w64-mingw32-<tool>`.
+# (Bash on MSYS2 can find unprefixed i686-w64-mingw32-gcc on PATH, so
+#  absolute /bin/ is not required; meson resolves it correctly.)
+# ---------------------------------------------------------------------------
+
+cross_candidates = [
+    os.path.join(BUILD_DIR, 'meson_cross.txt'),
+    # Also try the sibling dir sometimes used
+    os.path.join(os.path.dirname(BUILD_DIR), 'build', 'meson_cross.txt')
+    if os.path.dirname(BUILD_DIR) else None,
+]
+
+cross_candidates = [p for p in cross_candidates if p and os.path.isfile(p)]
+
+# If the fixed ones aren't found, search BUILD_DIR shallowly (1 level) for any
+# meson_cross*.txt file:
+if not cross_candidates:
+    try:
+        for name in os.listdir(BUILD_DIR):
+            full = os.path.join(BUILD_DIR, name)
+            if os.path.isfile(full) and 'meson_cross' in name and name.endswith('.txt'):
+                cross_candidates.append(full)
+    except OSError:
+        pass
+
+if cross_candidates:
+    import re as _re
+    # /bin/i686-gcc  /bin/i686-g++  /bin/i686-ar  /bin/i686-ld  /bin/i686-strip
+    # /bin/i686-objcopy  /bin/i686-nm  /bin/i686-pkg-config etc.
+    tool_re = _re.compile(r"/bin/i686-([A-Za-z0-9_.+\-]+)")
+    cross_fixed_count = 0
+    for cf in cross_candidates:
+        try:
+            with open(cf, 'r', encoding='utf-8') as f:
+                data = f.read()
+        except OSError as e:
+            print(f"v18.4 cross-file: read error for {cf}: {e}")
+            continue
+        matches = tool_re.findall(data)
+        if not matches:
+            print(f"v18.4 cross-file: {cf} — no /bin/i686-* references found; check:")
+            # Diagnose: print any compiler lines
+            for line in data.splitlines():
+                if any(k in line.lower() for k in ('gcc', 'g++', 'clang', 'ar ', 'ld ', 'compiler')):
+                    print(f"  | {line.strip()[:160]}")
+            continue
+        def _replace(m):
+            tool = m.group(1)
+            return f"i686-w64-mingw32-{tool}"
+        new_data = tool_re.sub(_replace, data)
+        with open(cf, 'w', encoding='utf-8', newline='\n') as f:
+            f.write(new_data)
+        cross_fixed_count += 1
+        unique_tools = list(set(matches))
+        print(f"v18.4 FIXED meson_cross: {cf}")
+        print(f"v18.4   rewritten /bin/i686-* -> i686-w64-mingw32-* for tools: {', '.join(sorted(unique_tools))}")
+        # Print a few compiler-related lines after fix for visual sanity-check
+        printed = 0
+        for line in new_data.splitlines():
+            low = line.lower()
+            if any(k in low for k in ('gcc', 'g++', 'clang', 'ar =', 'ld =', 'strip', 'objcopy', 'windres')):
+                print(f"  + {line.strip()[:180]}")
+                printed += 1
+                if printed >= 6:
+                    break
+    if cross_fixed_count == 0:
+        print("v18.4 meson_cross: files found but none required rewriting.")
+else:
+    print(f"v18.4 meson_cross.txt: NOT found under {BUILD_DIR}")
+    # Diagnostic: list some shallow entries of BUILD_DIR so we see what's there
+    try:
+        entries = sorted(os.listdir(BUILD_DIR))[:40]
+        print(f"v18.4   shallow listing of BUILD_DIR ({len(entries)} of {len(os.listdir(BUILD_DIR))} entries): {', '.join(entries)}")
+    except OSError:
+        pass
