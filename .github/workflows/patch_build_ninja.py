@@ -90,8 +90,11 @@ while i < n:
                 i += 1
         continue
 
-    # Also disable the build statement that triggers RERUN_CMAKE
-    if re.match(r'^build\s+\S+\s*:\s*RERUN_CMAKE\b', line):
+    # Also disable the build statement that triggers RERUN_CMAKE.
+    # v15.1 fix: use .+? instead of \S+ because RERUN_CMAKE build
+    # statements have MULTIPLE outputs separated by spaces:
+    #   build build.ninja D$:...cmake_install.cmake D$:...: RERUN_CMAKE | deps...
+    if re.match(r'^build\s+.+?:\s*RERUN_CMAKE\b', line):
         # Replace this build statement's command by patching its COMMAND var
         new_lines.append(line)
         i += 1
@@ -116,7 +119,15 @@ while i < n:
     # ----------------------------------------------------------
     build_match = re.match(r'^build\s+(.+?)\s*:\s+\w+', line)
     if build_match:
-        output = build_match.group(1).strip()
+        output_raw = build_match.group(1).strip()
+        # CRITICAL FIX v15.1: ninja build statements use `|` to separate
+        # explicit outputs from implicit outputs:
+        #   build output1 | output2 : RULE deps...
+        # We must only use the FIRST output (before the first `|`).
+        # v15.0 captured the entire "output1 | output2" string as the
+        # path, causing cmake -E touch to fail on a non-existent file
+        # containing " | " in its name.
+        output = output_raw.split('|')[0].strip()
         # Normalize path separators for matching
         output_norm = output.replace('\\', '/')
 
