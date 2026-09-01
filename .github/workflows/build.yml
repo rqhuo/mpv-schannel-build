@@ -460,6 +460,24 @@ jobs:
           grep -A3 'shaderc-manual-install' "$SB/build/build.ninja" | head -n 8 || true
           echo "---- sample: grep RERUN_CMAKE ----"
           grep -A3 'RERUN_CMAKE' "$SB/build/build.ninja" | head -n 12 || true
+          # V17 CRITICAL VERIFICATION: mpv / mpv-release CORE steps must
+          # NOT be replaced with cmake -E touch. Their COMMAND must remain
+          # the original cmake -P ...-.cmake so meson setup + ninja run.
+          echo "==== V17 VERIFY: mpv-release core step COMMANDs (must NOT be cmake -E touch) ===="
+          for key in mpv-release-configure mpv-release-build mpv-release-install mpv-release-strip-binary; do
+            echo "---- $key ----"
+            grep -A3 "^build .*${key} :" "$SB/build/build.ninja" 2>/dev/null | head -n 5 || echo "(no build rule found)"
+          done
+          echo "==== V17 VERIFY: mpv core step COMMANDs (must NOT be cmake -E touch) ===="
+          for key in mpv-configure mpv-build mpv-install mpv-strip-binary; do
+            echo "---- $key ----"
+            grep -A3 "^build .*${key} :" "$SB/build/build.ninja" 2>/dev/null | head -n 5 || echo "(no build rule found)"
+          done
+          echo "==== V17 VERIFY: mpv safe-skip steps (SHOULD be cmake -E touch) ===="
+          for key in mpv-release-removebuild mpv-release-copy-binary mpv-release-fullclean mpv-removeprefix; do
+            echo "---- $key ----"
+            grep -A3 "^build .*${key} :" "$SB/build/build.ninja" 2>/dev/null | head -n 5 || echo "(no build rule found)"
+          done
 
       # -------- 跑 ninja。预计 2-4 小时。 --------
       - name: Build (ninja superbuild)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-patch_build_ninja.py  —  v16 NINJA-DAG SURGERY
+patch_build_ninja.py  —  v17 NINJA-DAG SURGERY
 
 Replaces the COMMAND for every build rule whose output is a stamp file
 belonging to one of our 29 whitelisted (non-critical) packages.
@@ -24,6 +24,27 @@ v16.4 fixes:
     fail. Now: cmd.exe /C "...command && bash rescue_cp.sh"
   - Remove quotes around rescue_cp.sh path (inserted inside cmd.exe
     quotes, nested quotes would break parsing). Path has no spaces.
+
+v17 fixes (CRITICAL — root cause of v16.x empty mpv-build dir):
+  - NEVER_TOUCH_PKGS: mpv / mpv-release are EXCLUDED from EVERY patching
+    path (whitelist PKGS, UNIVERSAL_SKIP_STEPS, SKIP_VIA_TOUCH_STEPS)
+    EXCEPT for a tiny safe subset of steps that never affect DLL output
+    (copy-binary / copy-package-dir / fullclean / liteclean / delete-dir).
+    v16 accidentally short-circuited mpv-install to cmake echo_append
+    and let configure/build *-.cmake scripts silently return 0, so meson
+    setup + ninja never ran.  v17 guarantees mpv real work steps stay
+    untouched and their COMMANDs execute verbatim.
+  - mpv-rescue now fires TWICE: after -build (fresh compile) AND after
+    -strip-binary (stripped/final size).  This maximises chance of
+    preserving a libmpv-2.dll even if install/removebuild delete the
+    build tree immediately afterwards.
+  - ALWAYS_REMOVE_BUILD_DIRS interaction: superbuild compiles the
+    ExternalProject_Add `removebuild` step into a side-effect that
+    empties the build dir BEFORE re-configuring — we must NOT replace
+    mpv/mpv-release removebuild/postremovebuild with cmake -E touch;
+    instead, for these two packages ONLY we KEEP THE ORIGINAL COMMAND
+    so downstream DAG logic is consistent.  (The rescue runs preserve
+    the DLL regardless of later deletions.)
 
 Usage:  python patch_build_ninja.py <build_dir>
 """
@@ -51,9 +72,33 @@ WHITELIST_PKGS = [
     "openssl", "mbedtls",
 ]
 
+# ================================================================
+# V17  NEVER, EVER touch these packages — they build our end-goal
+#      libmpv-2.dll.  Their configure / build / install / strip /
+#      force-meson-configure / check-git / write-head / patch /
+#      download / update / mkdir / done  steps must run the ORIGINAL
+#      COMMAND or the DAG lies about success.
+#
+#      The ONLY exceptions are housekeeping steps we explicitly
+#      whitelist in NEVER_TOUCH_SAFE_SKIP (they never write object
+#      code and often fail for cosmetic reasons on CI).
+# ================================================================
+NEVER_TOUCH_PKGS = ["mpv", "mpv-release"]
+
+# Steps inside NEVER_TOUCH_PKGS that are STILL safe to cmake -E touch:
+#   - copy-binary       → mpv-package/ dir missing in CI no-op layout
+#   - copy-package-dir  → impl.cmake shell cmds fail in env w/o unzip/7z
+#   - fullclean / liteclean / delete-dir / removeprefix
+#                       → rm -rf helpers, no impact on build output
+NEVER_TOUCH_SAFE_SKIP = [
+    "copy-binary", "copy-package-dir",
+    "fullclean", "liteclean", "delete-dir",
+    "removeprefix", "removebuild", "postremovebuild",
+]
+
 # V16: UNIVERSAL skip steps — these steps are patched for ALL packages
-# (not just whitelisted ones) because they cause build directory deletion
-# which loses our compiled DLLs before copy-binary can run.
+# EXCEPT NEVER_TOUCH_PKGS (see NEVER_TOUCH_SAFE_SKIP above for the tiny
+# subset of mpv/* steps we ARE still willing to short-circuit).
 # - removebuild: deletes the package's build/ directory (loses .dll/.exe)
 # - postremovebuild: post-cleanup after removebuild
 UNIVERSAL_SKIP_STEPS = ["removebuild", "postremovebuild"]
@@ -64,21 +109,42 @@ UNIVERSAL_SKIP_STEPS = ["removebuild", "postremovebuild"]
 # fullclean/liteclean/delete-dir may delete build dirs with our DLLs.
 SKIP_VIA_TOUCH_STEPS = ["copy-binary", "copy-package-dir", "fullclean", "liteclean", "delete-dir"]
 
-# V16.1: After these build steps complete, immediately copy DLL to rescue dir.
-# Key insight: mpv-build generates libmpv-2.dll, but some later step may
-# delete it before the rescue monitor's 1-second polling interval catches it.
-# By appending cp directly to the build COMMAND, we copy the DLL the instant
-# it's created.
+# V17: Removeprefix / strip build prefix — often destructive and
+# unnecessary in CI.  Apply to all non-NEVER_TOUCH packages; for
+# NEVER_TOUCH packages we also skip them (they're in SAFE_SKIP).
+EXTRA_UNIVERSAL_SKIP = ["removeprefix"]
+
+# V16.1 + v17: After these build steps complete, immediately copy DLL
+# to rescue dir.  v17 runs rescue TWICE per package because:
+#   1) right after `-build`  →  unstripped DLL is present
+#   2) right after `-strip-binary` → stripped DLL is present
+# If install runs `meson install` + ALWAYS_REMOVE_BUILD_DIRS deletes
+# the build dir between steps 1 and later diagnostics, at least one
+# rescue copy will have won the race.
 RESCUE_AFTER_BUILD = {
     "mpv-build": {
         "dll": "packages/mpv-prefix/src/mpv-build/libmpv-2.dll",
         "exe": "packages/mpv-prefix/src/mpv-build/mpv.exe",
         "impla": "packages/mpv-prefix/src/mpv-build/libmpv.dll.a",
+        "tag": "post-build",
     },
     "mpv-release-build": {
         "dll": "packages/mpv-release-prefix/src/mpv-release-build/libmpv-2.dll",
         "exe": "packages/mpv-release-prefix/src/mpv-release-build/mpv.exe",
         "impla": "packages/mpv-release-prefix/src/mpv-release-build/libmpv.dll.a",
+        "tag": "post-build",
+    },
+    "mpv-strip-binary": {
+        "dll": "packages/mpv-prefix/src/mpv-build/libmpv-2.dll",
+        "exe": "packages/mpv-prefix/src/mpv-build/mpv.exe",
+        "impla": "packages/mpv-prefix/src/mpv-build/libmpv.dll.a",
+        "tag": "post-strip",
+    },
+    "mpv-release-strip-binary": {
+        "dll": "packages/mpv-release-prefix/src/mpv-release-build/libmpv-2.dll",
+        "exe": "packages/mpv-release-prefix/src/mpv-release-build/mpv.exe",
+        "impla": "packages/mpv-release-prefix/src/mpv-release-build/libmpv.dll.a",
+        "tag": "post-strip",
     },
 }
 
@@ -112,12 +178,56 @@ def parse_outputs(output_raw):
                 all_outputs.append(tok)
     return all_outputs
 
+def is_never_touch_output(out_norm):
+    """Check if a single output belongs to a NEVER_TOUCH_PKG and is NOT in
+    the NEVER_TOUCH_SAFE_SKIP whitelist. Returns:
+      - 'core_step'  → NEVER_TOUCH pkg + NOT safe-skip → DO NOT TOUCH
+      - 'safe_skip'  → NEVER_TOUCH pkg + safe-skip     → OK to touch
+      - None         → not a NEVER_TOUCH pkg            → normal check
+    """
+    for nt_pkg in NEVER_TOUCH_PKGS:
+        # Match: <...>/<nt_pkg>-stamp/<nt_pkg>-<step>
+        stamp_pattern = f'/{nt_pkg}-stamp/{nt_pkg}-'
+        if stamp_pattern in out_norm:
+            # Extract step suffix after /<nt_pkg>-stamp/<nt_pkg>-
+            idx = out_norm.index(stamp_pattern) + len(stamp_pattern)
+            step = out_norm[idx:]
+            # Also strip any trailing slash content (unlikely for stamps)
+            step = step.split('/')[0].split('\\')[0]
+            if step in NEVER_TOUCH_SAFE_SKIP:
+                return 'safe_skip'
+            else:
+                # configure, build, install, strip-binary, patch, download,
+                # update, mkdir, write-head, force-meson-configure, check-git,
+                # copy-versionfile, done, etc. → MUST NOT be touched.
+                return 'core_step'
+    return None
+
 def is_whitelisted_output(outputs):
-    """Return True if ANY output matches a whitelisted package pattern,
-    OR if ANY output ends with a UNIVERSAL_SKIP_STEP (e.g. -removebuild),
-    OR if ANY output ends with a SKIP_VIA_TOUCH_STEP (e.g. -copy-binary)."""
+    """Return True if ANY output should be short-circuited to cmake -E touch.
+
+    Priority (V17 critical fix):
+      1. NEVER_TOUCH_PKGS (mpv, mpv-release) CORE steps → False (NO touch)
+      2. NEVER_TOUCH_PKGS SAFE_SKIP steps              → True  (OK touch)
+      3. WHITELIST_PKGS any step                        → True  (touch)
+      4. UNIVERSAL_SKIP_STEPS (removebuild, postremovebuild) → True
+      5. SKIP_VIA_TOUCH_STEPS (copy-binary, etc.)       → True
+      6. EXTRA_UNIVERSAL_SKIP (removeprefix)            → True
+    """
+    has_never_touch_safe = False
     for out in outputs:
         out_norm = out.replace('\\', '/')
+
+        # ---- V17: NEVER_TOUCH_PKGS take absolute priority ----
+        nt_status = is_never_touch_output(out_norm)
+        if nt_status == 'core_step':
+            # mpv/mpv-release real-work step: REFUSE touch, no further check
+            return False
+        if nt_status == 'safe_skip':
+            has_never_touch_safe = True
+            # continue checking; safe-skip will be combined with universal
+            # skip checks below to return True
+
         # V16: check whitelist packages
         for pkg, regex in PKG_REGEXES:
             if regex.search(out_norm):
@@ -126,10 +236,19 @@ def is_whitelisted_output(outputs):
         for step in UNIVERSAL_SKIP_STEPS:
             if out_norm.endswith('-' + step):
                 return True
-        # V16.1: check skip-via-touch steps (copy-binary)
+        # V16.1: check skip-via-touch steps (copy-binary etc.)
         for step in SKIP_VIA_TOUCH_STEPS:
             if out_norm.endswith('-' + step):
                 return True
+        # V17: EXTRA_UNIVERSAL_SKIP (removeprefix) — previously unused
+        for step in EXTRA_UNIVERSAL_SKIP:
+            if out_norm.endswith('-' + step):
+                return True
+
+    # If any output was a NEVER_TOUCH safe-skip (and no core_step vetoed),
+    # allow touching it.
+    if has_never_touch_safe:
+        return True
     return False
 
 def is_rescue_step(outputs):
@@ -362,6 +481,7 @@ while i < n:
 with open(NINJA_FILE, 'w', encoding='utf-8', newline='\n') as f:
     f.writelines(new_lines)
 
-print(f"v16.4 patch_build_ninja.py: patched {patched} build rule COMMANDs -> cmake -E touch chain")
-print(f"v16.4 patch_build_ninja.py: RERUN_CMAKE disabled = {rerun_patched}")
-print(f"v16.4 patch_build_ninja.py: file = {NINJA_FILE}")
+print(f"v17 patch_build_ninja.py: patched {patched} build rule COMMANDs -> cmake -E touch chain")
+print(f"v17 patch_build_ninja.py: NEVER_TOUCH_PKGS = {NEVER_TOUCH_PKGS} (core steps PROTECTED)")
+print(f"v17 patch_build_ninja.py: RERUN_CMAKE disabled = {rerun_patched}")
+print(f"v17 patch_build_ninja.py: file = {NINJA_FILE}")
