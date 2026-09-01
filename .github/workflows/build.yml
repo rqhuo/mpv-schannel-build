@@ -476,8 +476,43 @@ jobs:
           # build.ninja 已经被 patch_build_ninja.py 修改过：
           #   - 29 个白名单包的 COMMAND 替换为 cmake -E touch <output>
           #   - RERUN_CMAKE 规则被 no-op
+
+          # V16 RESCUE: ALWAYS_REMOVE_BUILD_DIRS=ON 会在 mpv install 后
+          # 删除 mpv-build 目录，导致 copy-binary 步骤失败且 DLL 丢失。
+          # 用后台监控进程：一旦发现 libmpv-2.dll 就立即拷贝到安全位置。
+          RESCUE_DIR="$SB/build/rescue"
+          mkdir -p "$RESCUE_DIR"
+          (
+            for i in $(seq 1 7200); do  # 最多监控 2 小时 (7200 * 1s)
+              for src in \
+                "$SB/build/packages/mpv-prefix/src/mpv-build/libmpv-2.dll" \
+                "$SB/build/packages/mpv-release-prefix/src/mpv-release-build/libmpv-2.dll" \
+                "$SB/build/local32/bin/libmpv-2.dll" \
+                "$SB/build/install/bin/libmpv-2.dll"; do
+                if [ -s "$src" ]; then
+                  cp -f "$src" "$RESCUE_DIR/libmpv-2.dll"
+                  echo "==== RESCUE: copied $src -> $RESCUE_DIR/libmpv-2.dll ===="
+                  # 也拷贝 mpv.exe 和 libmpv.dll.a 如果存在
+                  srcdir="$(dirname "$src")"
+                  [ -f "$srcdir/mpv.exe" ] && cp -f "$srcdir/mpv.exe" "$RESCUE_DIR/" || true
+                  [ -f "$srcdir/libmpv.dll.a" ] && cp -f "$srcdir/libmpv.dll.a" "$RESCUE_DIR/" || true
+                  [ -f "$srcdir/client.h" ] && cp -f "$srcdir/client.h" "$RESCUE_DIR/" || true
+                  exit 0
+                fi
+              done
+              sleep 1
+            done
+          ) &
+          RESCUE_PID=$!
+          echo "==== rescue monitor started (PID=$RESCUE_PID), watching for libmpv-2.dll ===="
+
           ninja -j3 -v -k 100 2>&1 | tee "$LOG" | tail -n 6000
           RC=${PIPESTATUS[0]:-$?}
+
+          # 停止救援监控
+          kill $RESCUE_PID 2>/dev/null || true
+          wait $RESCUE_PID 2>/dev/null || true
+
           echo "==== ninja exit code = $RC ===="
           # ----------------------------------------------------------------
           # V14.1b SUCCESS SHORTCUT: if our end goal (libmpv-2.dll) exists
@@ -489,7 +524,9 @@ jobs:
           # (Locate + Upload artifact) run and deliver the DLL to us.
           # ----------------------------------------------------------------
           SUCCESS_DLL=""
+          RESCUE_DIR="$SB/build/rescue"
           for maybe in \
+            "$RESCUE_DIR/libmpv-2.dll" \
             "$SB/build/local32/bin/libmpv-2.dll" \
             "$SB/build/install/bin/libmpv-2.dll" \
             "/i686/bin/libmpv-2.dll" \
@@ -582,17 +619,26 @@ jobs:
           done
           exit "$RC"
 
-      # -------- 找产物：libmpv-2.dll (i686 superbuild 默认装到 local32/bin) --------
+      # -------- 找产物：libmpv-2.dll (V16: 优先从 rescue 目录找) --------
       - name: Locate libmpv-2.dll + dependencies
         run: |
           set -e
           SB="${GITHUB_WORKSPACE:-/c/trae}/mpv-winbuild"
           cd "$SB"
+          RESCUE_DIR="$SB/build/rescue"
+          echo "==== rescue dir ===="
+          ls -la "$RESCUE_DIR/" 2>/dev/null || echo "(rescue dir empty or missing)"
           echo "==== tree of build/local* / build/mpv* ===="
           find build/local* build/mpv* build/install* build/root* \
                -maxdepth 5 -type f \( -name 'libmpv-2.dll' -o -name 'mpv-2.dll' -o -name 'mpv.exe' \) 2>/dev/null || true
 
-          DLL="$(find build -type f \( -name 'libmpv-2.dll' -o -name 'mpv-2.dll' \) -print -quit)"
+          # V16: 优先从 rescue 目录找（DLL 编译成功后被 ALWAYS_REMOVE_BUILD_DIRS 清理了）
+          DLL=""
+          if [ -s "$RESCUE_DIR/libmpv-2.dll" ]; then
+            DLL="$RESCUE_DIR/libmpv-2.dll"
+          else
+            DLL="$(find build -type f \( -name 'libmpv-2.dll' -o -name 'mpv-2.dll' \) -print -quit)"
+          fi
           if [ -z "$DLL" ]; then
             echo "!!! libmpv-2.dll NOT FOUND; listing all .dll under build/"
             find build -type f -name '*.dll' -o -name '*.exe' 2>/dev/null | head -n 200
@@ -612,10 +658,14 @@ jobs:
           BASEDIR="$(dirname "$DLL")"
           [ -f "${BASEDIR}/mpv.exe"      ] && cp -f "${BASEDIR}/mpv.exe"         "$OUTDIR/" || true
           [ -f "${BASEDIR}/libmpv.dll.a" ] && cp -f "${BASEDIR}/libmpv.dll.a"    "$OUTDIR/" || true
+          # 也从 rescue 目录拷
+          [ -f "$RESCUE_DIR/mpv.exe"      ] && cp -f "$RESCUE_DIR/mpv.exe"       "$OUTDIR/" || true
+          [ -f "$RESCUE_DIR/libmpv.dll.a" ] && cp -f "$RESCUE_DIR/libmpv.dll.a"  "$OUTDIR/" || true
           IMP="$(find build -type f -name 'libmpv.dll.a' -print -quit)"
           [ -n "$IMP" ] && cp -f "$IMP" "$OUTDIR/libmpv.dll.a" || true
           CLIENT_H="$(find build -type f -path '*/mpv/*/client.h' -print -quit)"
           [ -z "$CLIENT_H" ] && CLIENT_H="$(find mpv source sources -type f -name 'client.h' -path '*/mpv/*' -print -quit 2>/dev/null || true)"
+          [ -z "$CLIENT_H" ] && [ -f "$RESCUE_DIR/client.h" ] && CLIENT_H="$RESCUE_DIR/client.h"
           [ -n "$CLIENT_H" ] && cp -f "$CLIENT_H" "$OUTDIR/mpv_client.h" || true
 
           echo "==== artifact dir ===="

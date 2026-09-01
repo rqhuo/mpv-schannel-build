@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-patch_build_ninja.py  —  v15.2 NINJA-DAG SURGERY
+patch_build_ninja.py  —  v16 NINJA-DAG SURGERY
 
 Replaces the COMMAND for every build rule whose output is a stamp file
 belonging to one of our 29 whitelisted (non-critical) packages.
@@ -11,6 +11,11 @@ v15.2 fixes:
     (v15.1 only handled `out1 | out2` implicit outputs)
   - Whitelist match if ANY output matches (was only checking first)
   - Touch ALL outputs with `&&` chained commands
+
+v16 fixes:
+  - UNIVERSAL_SKIP_STEPS: patch removebuild + postremovebuild for ALL
+    packages (not just whitelisted). These steps delete build dirs and
+    lose compiled DLLs before copy-binary can run.
 
 Usage:  python patch_build_ninja.py <build_dir>
 """
@@ -37,6 +42,13 @@ WHITELIST_PKGS = [
     # Tier 5: crypto neighbours (2)
     "openssl", "mbedtls",
 ]
+
+# V16: UNIVERSAL skip steps — these steps are patched for ALL packages
+# (not just whitelisted ones) because they cause build directory deletion
+# which loses our compiled DLLs before copy-binary can run.
+# - removebuild: deletes the package's build/ directory (loses .dll/.exe)
+# - postremovebuild: post-cleanup after removebuild
+UNIVERSAL_SKIP_STEPS = ["removebuild", "postremovebuild"]
 
 # Build a regex that matches: <pkg>-stamp[/\<]pkg>-<step>
 def make_pkg_regex(pkg):
@@ -69,11 +81,20 @@ def parse_outputs(output_raw):
     return all_outputs
 
 def is_whitelisted_output(outputs):
-    """Return True if ANY output matches a whitelisted package pattern."""
+    """Return True if ANY output matches a whitelisted package pattern,
+    OR if ANY output ends with a UNIVERSAL_SKIP_STEP (e.g. -removebuild)."""
     for out in outputs:
         out_norm = out.replace('\\', '/')
+        # V16: check whitelist packages
         for pkg, regex in PKG_REGEXES:
             if regex.search(out_norm):
+                return True
+        # V16: check universal skip steps (removebuild, postremovebuild)
+        # for ALL packages — these steps delete build dirs and lose our DLLs.
+        # Use simple endswith check to handle package names with dashes
+        # (e.g. x265-8+10bit-removebuild, gcc-binutils-removebuild)
+        for step in UNIVERSAL_SKIP_STEPS:
+            if out_norm.endswith('-' + step):
                 return True
     return False
 
@@ -187,6 +208,6 @@ while i < n:
 with open(NINJA_FILE, 'w', encoding='utf-8', newline='\n') as f:
     f.writelines(new_lines)
 
-print(f"v15.2 patch_build_ninja.py: patched {patched} build rule COMMANDs -> cmake -E touch chain")
-print(f"v15.2 patch_build_ninja.py: RERUN_CMAKE disabled = {rerun_patched}")
-print(f"v15.2 patch_build_ninja.py: file = {NINJA_FILE}")
+print(f"v16 patch_build_ninja.py: patched {patched} build rule COMMANDs -> cmake -E touch chain")
+print(f"v16 patch_build_ninja.py: RERUN_CMAKE disabled = {rerun_patched}")
+print(f"v16 patch_build_ninja.py: file = {NINJA_FILE}")
