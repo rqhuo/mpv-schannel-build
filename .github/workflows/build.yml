@@ -1,6 +1,6 @@
-#!/usr/bin/env python3
-"""
-patch_build_ninja.py  —  v15.2 NINJA-DAG SURGERY
+name: build-libmpv2-i686-schannel-superbuild
+
+on:
 
 Replaces the COMMAND for every build rule whose output is a stamp file
 belonging to one of our 29 whitelisted (non-critical) packages.
