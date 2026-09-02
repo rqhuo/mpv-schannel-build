@@ -138,8 +138,19 @@ jobs:
           # setup` choke on the next attempt. Wipe only this target's prefix
           # so it rebuilds from scratch while every other package (ffmpeg,
           # the cross toolchain, ...) is reused from cache.
+          #
+          # IMPORTANT: also remove the versioned package folder
+          # (build/mpv-<version>-i686) and build/mpv-package. These live in
+          # build/ (NOT under packages/mpv-release-prefix) so the rm above
+          # does not touch them. On a cached re-run they already exist from
+          # the previous build, and shinchiro's rename-stable.sh does an `mv`
+          # into build/mpv-<version>-i686/mpv-package which fails with
+          # "Directory not empty" when that destination is non-empty. Wiping
+          # it first makes the move deterministic.
           rm -rf "mpv-winbuild/build/packages/mpv-release-prefix" \
-                 "mpv-winbuild/build/packages/mpv-prefix"
+                 "mpv-winbuild/build/packages/mpv-prefix" \
+                 "mpv-winbuild/build/mpv-"*i686* \
+                 "mpv-winbuild/build/mpv-package" 2>/dev/null || true
           ninja -C mpv-winbuild/build "$MPV_TARGET"
 
       - name: Collect artifacts + verify Schannel build
