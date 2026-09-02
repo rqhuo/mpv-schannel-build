@@ -172,27 +172,43 @@ jobs:
           fi
 
           # ---- verification: the DLL must use Schannel, not OpenSSL ----
-          OBJDUMP="$GITHUB_WORKSPACE/mpv-winbuild/build/install/bin/i686-w64-mingw32-objdump"
+          # Use `strings` (always present) to inspect the PE import table and
+          # version strings. We intentionally do NOT rely on the cross
+          # toolchain's objdump (its install path varies / may be absent),
+          # so the verification can never break the artifact upload.
+          : > "$OUT/schannel-check.txt"
           {
-            echo "libmpv-2.dll imported DLLs:"
-            "$OBJDUMP" -p "$OUT/libmpv-2.dll" | grep "DLL Name"
+            echo "libmpv-2.dll size: $(stat -c%s "$OUT/libmpv-2.dll") bytes"
             echo
-            echo "OpenSSL strings inside libmpv-2.dll (expect none):"
-            if strings "$OUT/libmpv-2.dll" | grep -i "OpenSSL [0-9]" ; then
+            echo "OpenSSL version strings inside libmpv-2.dll (expect none):"
+            if strings "$OUT/libmpv-2.dll" | grep -i "OpenSSL [0-9]"; then
               echo "!!! OpenSSL DETECTED - build is NOT schannel-only"
               exit 31
             else
               echo "(none - good)"
             fi
-          } | tee "$OUT/schannel-check.txt"
-          # Schannel goes through SSPI: SECUR32.dll must be imported
-          "$OBJDUMP" -p "$OUT/libmpv-2.dll" | grep -qi "SECUR32.dll" \
-            || { echo "!!! SECUR32.dll not imported - schannel missing?"; exit 32; }
+            echo
+            echo "SECUR32.dll referenced (Schannel/SSPI must be used):"
+            if strings "$OUT/libmpv-2.dll" | grep -qi "SECUR32.dll"; then
+              echo "SECUR32.dll referenced - Schannel present (good)"
+            else
+              echo "!!! SECUR32.dll NOT referenced - schannel missing?"
+              exit 32
+            fi
+            # optional: full import list via objdump if it happens to exist
+            OBJDUMP=$(find "$B/install/bin" -name '*-objdump' -type f 2>/dev/null | head -1)
+            if [ -n "$OBJDUMP" ]; then
+              echo
+              echo "Imported DLLs (via $OBJDUMP):"
+              "$OBJDUMP" -p "$OUT/libmpv-2.dll" 2>/dev/null | grep "DLL Name" || true
+            fi
+          } | tee -a "$OUT/schannel-check.txt"
 
           echo "==== artifact ===="
           ls -la "$OUT" "$OUT/include/mpv"
 
       - name: Upload artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: libmpv-2-i686-schannel
