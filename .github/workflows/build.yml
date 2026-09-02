@@ -49,6 +49,13 @@ on:
     paths:
       - '.github/workflows/build.yml'
       - 'patches/**'
+  # Automatically rebuild on a schedule so the artifact always tracks the
+  # latest stable mpv / ffmpeg. The superbuild fetches the newest release tag
+  # at build time (packages/mpv-release.cmake queries /releases/latest), so a
+  # periodic rebuild = automatic pickup of new versions.
+  # Disable or retune the cron if you don't want periodic rebuilds.
+  schedule:
+    - cron: '0 18 * * 0'   # every Sunday 18:00 UTC (~02:00 Beijing, Monday)
 
 concurrency:
   group: build-libmpv-i686-schannel
