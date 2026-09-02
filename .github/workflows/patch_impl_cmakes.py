@@ -72,35 +72,202 @@ def _cmake_quote_for_set(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
+def _cmake_split_args(inner: str):
+    """Split the inner of a CMake set(command "<inner>") value into its
+    semicolon-separated argument list.
+
+    The naive `inner.split(";")` is incorrect because CMake COMMAND values
+    often carry tokens with EMBEDDED double-quote wrappers (e.g.
+    `-DCMAKE_C_FLAGS="-O2 -g"`) where the enclosing "" are part of the single
+    argument's value; any `;` or literal character *inside* those "" is part
+    of the argument and must NOT split the list.
+
+    Rules (mirroring CMake's quoted-string semantics in double-quoted args):
+      - We walk character-by-character.  `in_q` tracks whether we are inside
+        an un-escaped double-quote run.
+      - `\\"` (a literal `\"` inside the outer set(command "…") string) means
+        the cmake-level string contains ONE literal `"` character → toggle
+        in_q.
+      - `;` only breaks the current item when in_q == False.
+      - `\\\\` inside outer "" → one literal `\\`.
+    """
+    items = []
+    cur = []
+    i = 0
+    n = len(inner)
+    in_q = False
+    while i < n:
+        ch = inner[i]
+        if ch == '\\' and i + 1 < n and inner[i + 1] in ('\\', '"'):
+            # CMake backslash escape inside double-quoted value.  Preserve as
+            # literal 2-char sequence in the current arg so bash_recompose sees
+            # the real raw text (it strips "" wrappers later anyway).
+            cur.append(inner[i:i + 2])
+            i += 2
+            continue
+        if ch == '"':
+            # Toggle "inside quoted arg" state.  Keep the " char in the token
+            # because bash_recompose / _is_build_exec_token both know how to
+            # strip outer CMake "" wrappers already.
+            in_q = not in_q
+            cur.append('"')
+            i += 1
+            continue
+        if ch == ';' and not in_q:
+            items.append("".join(cur))
+            cur = []
+            i += 1
+            continue
+        cur.append(ch)
+        i += 1
+    items.append("".join(cur))
+    return items
+
+
+def _find_setcommand_boundary(line: str):
+    """Locate the `set(command "…")` call inside one line.
+
+    The previous version used a regex with `[^"]*` as the inner capture group,
+    which completely fails for legitimate COMMAND values that contain literal
+    double-quote characters as part of an argument (e.g.
+    `-DCMAKE_C_FLAGS="-O2 -g"`) — the pattern stops consuming characters at
+    the FIRST embedded `"` instead of the outer closing `"` that belongs to
+    the `set(command "...")` syntax itself → Strategy 0 match count 0.
+
+    New parser: walk the line, find `set(…command …)`, then inside the parens
+    consume the CMake-escaped double-quoted payload that follows `command`.
+    Returns (prefix, inner, suffix) character ranges OR None if this line
+    doesn't contain a parsable `set(command "<inner>")` call.
+    """
+    # Step 1: find "set(" (case-insensitive) and its matching ')'.
+    s = line
+    # lenient lower-case scan for 'set('
+    s_low = s.lower()
+    set_start = s_low.find("set(")
+    if set_start < 0:
+        # Try whitespace variants: set  (  …  )
+        m = re.search(r'\bset\s*\(', s, re.IGNORECASE)
+        if not m:
+            return None
+        set_start = m.start()
+        open_paren = m.end() - 1  # '('
+    else:
+        open_paren = set_start + 3
+    # Step 2: find the `command` keyword followed immediately (with ws) by `"`.
+    rest_i = open_paren + 1
+    while rest_i < len(s) and s[rest_i].isspace():
+        rest_i += 1
+    # Must read exactly "command" (case-insensitive)
+    if s_low[rest_i:rest_i + 7] != "command":
+        return None
+    rest_i += 7
+    while rest_i < len(s) and s[rest_i].isspace():
+        rest_i += 1
+    if rest_i >= len(s) or s[rest_i] != '"':
+        return None
+    inner_open = rest_i  # outer opening " of set(command "…")
+    # Step 3: locate the OUTER closing double-quote of the set(command "…")
+    # syntax.
+    #
+    # The obvious forward-scan approach (pick the FIRST unescaped ") breaks
+    # completely for stamp files whose arguments contain LITERAL double-quote
+    # characters — superbuild likes to write values like
+    # `-DCMAKE_C_FLAGS="-O2 -g"` where the inner quotes are part of the
+    # argument, NOT CMake-level backslash-escapes.  Our original code would
+    # therefore chop the value at the FIRST such embedded quote and produce:
+    #   inner  = 'D:/…/svtav1-build;-G;Ninja;-DCMAKE_C_FLAGS='
+    #   suffix = '"-O2 -g"")'
+    # → all subsequent shell quoting is wrong.
+    #
+    # Instead: (a) first find the BALANCED closing parenthesis of set(…),
+    # which is unambiguous because embedded parens would be inside "" and we
+    # never nest additional cmake calls inside these stamp-file lines; then
+    # (b) walk BACKWARDS from the ')' to find the LAST bare " before it —
+    # THAT is the outer closing quote.
+    paren_depth_start = 1  # set( opened one paren (already consumed)
+    k = open_paren + 1
+    close_paren = None
+    while k < len(s):
+        if s[k] == '(':
+            paren_depth_start += 1
+        elif s[k] == ')':
+            paren_depth_start -= 1
+            if paren_depth_start == 0:
+                close_paren = k
+                break
+        k += 1
+    if close_paren is None:
+        return None
+    # Walk backwards to find the LAST double-quote strictly before ')'.
+    inner_close = None
+    j = close_paren - 1
+    while j > inner_open:
+        if s[j] == '"':
+            # Do NOT stop on a CMake-escaped \" — that is just a literal "
+            # inside the value, not the outer string boundary.
+            if j - 1 >= inner_open and s[j - 1] == '\\':
+                # But \\" → literal \ followed by real quote — so only skip
+                # when the preceding backslash count is ODD.
+                bs_count = 0
+                p = j - 1
+                while p > inner_open and s[p] == '\\':
+                    bs_count += 1
+                    p -= 1
+                if bs_count % 2 == 1:
+                    j = p
+                    continue
+            inner_close = j
+            break
+        j -= 1
+    if inner_close is None or inner_close <= inner_open:
+        return None
+    prefix = s[:inner_open]       # up to and NOT including the opening outer "
+    inner = s[inner_open + 1:inner_close]  # between the outer ""
+    suffix = s[inner_close:close_paren + 1]  # includes outer " + anything inside set() + ')'.
+    return prefix, inner, suffix
+
+
 def _patch_setcommand_buildexec(text: str) -> tuple:
-    """Replace every line matching
+    """Replace every line containing
          set(command "D:/…/build/exec;tok1;tok2;…")
-    with
+    (with arbitrary embedded double-quote content inside args) by
          set(command "bash;-lc;<recomposed-shell-string>")
 
     Returns (new_text, replacement_count).
-    """
-    pat = re.compile(r'^(\s*set\s*\(\s*command\s*")([^"]*)("\s*\)\s*)$', re.MULTILINE)
-    count = [0]  # mutable int wrapper for closure
 
-    def _sub(m):
-        prefix = m.group(1)
-        inner = m.group(2)
-        suffix = m.group(3)
-        items = inner.split(";")
+    V21 changes (see also bash_recompose above):
+      * Replaced the regex parser with a char-level scanner
+        `_find_setcommand_boundary()` because the previous `[^"]*` inner
+        capture could not match CMake COMMAND strings whose arguments carry
+        embedded "…" wrappers (like `-DCMAKE_C_FLAGS="-O2 -g"`).
+      * Item splitter switched from str.split(";") to the quote-aware
+        `_cmake_split_args()` helper.
+    """
+    count = [0]
+    lines = text.split("\n")
+    new_lines = []
+    for line in lines:
+        bound = _find_setcommand_boundary(line)
+        if bound is None:
+            new_lines.append(line)
+            continue
+        prefix, inner, suffix = bound
+        # Quick reject without allocations: inner must start with build/exec.
+        # (Need to split to grab tokens[0] robustly for the quoted-path case.)
+        items = _cmake_split_args(inner)
         if not items or not _is_build_exec_token(items[0]):
-            return m.group(0)
+            new_lines.append(line)
+            continue
         rest = items[1:]
         if not rest:
             shell_cmd = "true"
         else:
             shell_cmd = bash_recompose(rest)
         new_inner = "bash;-lc;" + _cmake_quote_for_set(shell_cmd)
+        new_line = f"{prefix}\"{new_inner}\"{suffix[1:]}"  # suffix already starts with the closing outer "
         count[0] += 1
-        return f"{prefix}{new_inner}{suffix}"
-
-    result = pat.sub(_sub, text)
-    return result, count[0]
+        new_lines.append(new_line)
+    return "\n".join(new_lines), count[0]
 
 SAFE_BARE_NAMES = {
     # CMake family
@@ -191,15 +358,39 @@ def bash_recompose(tokens):
     CMake's quote wrappers around them), produce a single bash-syntax command
     string that, when eval'd or passed to bash -c, reproduces argv faithfully.
 
-    Caveat: shell control operators like `&&` / `||` / `;` / `|` / redirects
-    (`>`, `<`, `>>`, `2>`, `2>&1`, `&>`, `&`, `1>`) are NOT arguments — they
-    are bash syntactic constructs.  If we wrap them in single quotes they
-    become literal strings and lose their semantics.  So for this tiny subset
-    we emit them verbatim without quoting.
+    V21: the previous version wrapped EVERY non-SHELL_OP token in shell single
+    quotes.  That caused three separate classes of failure inside the
+    superbuild when paired with `set(command "bash;-lc;<recomposed>")` inside
+    CMake stamp files, all visible in logs_91112829316:
 
-    For everything else we emulate bash-printf %q: single-quote every token,
-    and for any single quote inside a token, close the current quote, add
-    '\'', reopen.
+      (A) `CONF=1 ./configure` appeared AFTER a shell control operator
+          (`&&`) and the old leading-only scan let it fall through to
+          default wrapping → `'CONF=1' './configure'` → bash tries to run a
+          LITERAL command called "CONF=1" → exit 127.
+      (B) Every plain argv word (`'cmake' '-G' 'Ninja' '-H<path>'`) was
+          wrapped in single quotes.  Individually harmless, but when
+          combined with (C) and CMake's double-quoted string-escape layer
+          (via `_cmake_quote_for_set` → `\"` escapes) the final shell string
+          ends up with quote-stacking that confuses the argument splitter.
+      (C) Tokens carrying EMBEDDED CMake-level double quotes (e.g.
+          `-DCMAKE_C_FLAGS="<space separated CFLAGS list>"`) had their
+          outer "" preserved and the inner content escaped, causing shell
+          single-quote layers to wrap the double-quote wrapper too, so
+          CMake received the value as the literal concatenated string
+          `"\"-foo=...\""` — i.e. with literal backslashes still present.
+
+    New quoting policy (MINIMAL quotes):
+      * SHELL_OPS        → emit verbatim, and re-enable env-prefix detection
+                           so `cd … && CONF=1 ./configure` keeps CONF=1 as
+                           an ENV prefix not an argv[0].
+      * NAME=VALUE tokens → emit VERBATIM (no quotes) when the scanner is in
+                            an "env context" (= at start, or just after any
+                            shell op).  Multiple NAME=VALUE can stack.
+      * Everything else   → shell-quote ONLY IF the token (after stripping
+                            CMake-level outer "") contains a shell-special
+                            char.  Safe plain words / -D options / Windows
+                            absolute paths / version numbers are all emitted
+                            verbatim.
     """
     SHELL_OPS = {
         "&&", "||", ";", "|", "&",
@@ -208,38 +399,41 @@ def bash_recompose(tokens):
         "2>&1", "1>&2", ">&", "<&",
         "2>/dev/null", ">/dev/null",
     }
-    def q(s):
-        # Unwrap CMake-level outer "" that might have been left — if the whole
-        # string is wrapped in matching double quotes, strip them first.
-        if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
-            s = s[1:-1]
-        inner = s.replace("'", "'\\''")
-        return f"'{inner}'"
-    pieces = []
-    # ---- V20 Phase A: leading NAME=VALUE tokens → bash env assignments.
-    #      MUST emit without quoting, otherwise `'CONF=1'` becomes a
-    #      literal argv[0] string instead of `CONF=1 cmd …` prefix form.
     _ENV_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
-    idx = 0
-    while idx < len(tokens):
-        t = tokens[idx]
-        core = t
-        if len(core) >= 2 and core[0] == '"' and core[-1] == '"':
-            core = core[1:-1]
-        if _ENV_RE.match(core):
-            pieces.append(core)  # emit VERBATIM (env-prefix form)
-            idx += 1
-        else:
-            break
-    # ---- Phase B: everything else → shell-quoted (or verbatim SHELL_OPS)
-    for t in tokens[idx:]:
-        core = t
-        if len(core) >= 2 and core[0] == '"' and core[-1] == '"':
-            core = core[1:-1]
+    # Shell-special characters that REQUIRE wrapping the token in single
+    # quotes for safe eval by `bash -lc`.  Note: =, :, /, \, -, _, ., +, %
+    # are NOT shell specials (they're fine in plain words).
+    _SHELL_SPECIAL_CHARS = set(" \t$`!*?#~[](){};&|<>\\'\"")
+
+    def _strip_cmake_outer(tok):
+        if len(tok) >= 2 and tok[0] == '"' and tok[-1] == '"':
+            return tok[1:-1]
+        return tok
+
+    def _shell_quote(value):
+        # value is the CMake-stripped token — never has a CMake "" wrapper.
+        if value == "":
+            return "''"
+        if not any(ch in _SHELL_SPECIAL_CHARS for ch in value):
+            return value
+        inner = value.replace("'", "'\\''")
+        return f"'{inner}'"
+
+    pieces = []
+    allow_env_prefix = True  # toggled True after every SHELL_OP
+    for t in tokens:
+        core = _strip_cmake_outer(t)
         if core in SHELL_OPS:
             pieces.append(core)
-        else:
-            pieces.append(q(t))
+            allow_env_prefix = True
+            continue
+        if allow_env_prefix and _ENV_RE.match(core):
+            # NAME=VALUE env prefix → emit VERBATIM.  Remain in env-context
+            # so consecutive NAME=VALUE tokens stack correctly.
+            pieces.append(core)
+            continue
+        pieces.append(_shell_quote(core))
+        allow_env_prefix = False
     return " ".join(pieces)
 
 
