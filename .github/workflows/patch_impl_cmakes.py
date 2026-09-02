@@ -63,22 +63,37 @@ import sys, os, re, pathlib, shlex, shutil
 # script-import time do we fall back to the bare name + hope PATH helps.
 # =========================================================================
 def _resolve_bash_exe() -> str:
-    # 1) Standard MSYS2 locations on GitHub Actions runners and local hosts
-    candidates = [
-        r"D:\a\_temp\msys64\usr\bin\bash.exe",
+    # 1) Prefer FORWARD-SLASH candidates on disk.  CreateProcess on NT fully
+    #    accepts "/" as a path separator inside absolute paths, AND they need
+    #    NO CMake escape treatment when embedded in set(command "…") strings
+    #    (the only backslash we'd otherwise have to double up is gone).
+    #    GitHub Actions default runner paths first, then local msys64.
+    candidates_fwd = [
         r"D:/a/_temp/msys64/usr/bin/bash.exe",
-        r"C:\msys64\usr\bin\bash.exe",
         r"C:/msys64/usr/bin/bash.exe",
     ]
-    for p in candidates:
+    for p in candidates_fwd:
         if os.path.isfile(p):
             return p
-    # 2) Use shutil.which (respects Python's inherited PATH).
+    # 2) Try the backslash variants as a fall-back.  If we land here, the
+    #    caller MUST run _cmake_quote_for_set(token) on it before putting
+    #    the value into a CMake double-quoted string, or CMake will choke on
+    #    Invalid character escape '\a' / '\t' / '\u' etc.
+    candidates_bs = [
+        r"D:\a\_temp\msys64\usr\bin\bash.exe",
+        r"C:\msys64\usr\bin\bash.exe",
+    ]
+    for p in candidates_bs:
+        if os.path.isfile(p):
+            return p
+    # 3) Use shutil.which (respects Python's inherited PATH).
     #    `bash.exe` is the PE binary name; "bash" as a fallback basename.
     p = shutil.which("bash.exe") or shutil.which("bash")
     if p:
         return p
-    # 3) Last-resort bare name (rely on PATH at execute_process time).
+    # 4) Last-resort bare name (rely on PATH at execute_process time, and
+    #    on the caller _cmake_quote_for_set()'ing it — it's a bare word so
+    #    no escaping is actually needed).
     return "bash"
 
 BASH_EXE_ABS = _resolve_bash_exe()
@@ -326,7 +341,16 @@ def _patch_setcommand_buildexec(text: str) -> tuple:
         # Rebuild: bash;<exec_sh_path>;<tok1>;<tok2>;…
         # Keep remaining items exactly as they were (no recompose).
         new_items = [BASH_EXE_ABS, exec_sh_path] + items[1:]
-        new_inner = ";".join(new_items)
+        # SAFETY: Every token going back into the CMake set(command "…")
+        # outer double-quote must have '\' and '"' escaped.  Without this, a
+        # backslash-absolute bash path like `D:\a\_temp\…\bash.exe` is parsed
+        # by cmake.exe -P as '\a' (BEL), '\t' (TAB), '\u…' (unicode), etc. →
+        #   Syntax error in cmake code …  Invalid character escape '\a'.
+        # Strategy 0 之前「items = 分号」切分开时原样保留了 token 内的
+        # CMake 字面转义，这里我们反向把每个 token 单独过一遍
+        # _cmake_quote_for_set（分号本身不是 CMake DQ 里的转义，安全）。
+        quoted_items = [_cmake_quote_for_set(tok) for tok in new_items]
+        new_inner = ";".join(quoted_items)
         new_line = f'{prefix}"{new_inner}"{suffix[1:]}'
         count[0] += 1
         new_lines.append(new_line)
@@ -1067,7 +1091,7 @@ def main() -> int:
             rel = p.relative_to(build_dir).as_posix()
             extra = f" [S0={s0_count}]" if s0_count else ""
             print(f"   patched: {rel}{extra}")
-    print(f"\nV23 DONE patch_impl_cmakes.py: scanned {count_seen} cmake files, "
+    print(f"\nV24 DONE patch_impl_cmakes.py: scanned {count_seen} cmake files, "
           f"patched {count_patched} (Strategy0 build/exec->bash@abs/exec.sh fixes={count_s0_fixes}), "
           f"bash resolved to: {BASH_EXE_ABS!r}; skipped {count_skipped}.")
     return 0
