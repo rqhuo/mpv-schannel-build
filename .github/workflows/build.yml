@@ -529,6 +529,33 @@ jobs:
           set +e
           SB="${GITHUB_WORKSPACE:-/c/trae}/mpv-winbuild"
           cd "$SB/build"
+
+          # V19: 把 MSYS2 usr/bin 的 Windows 绝对路径加到 PATH 前面。
+          #   build/exec PE wrapper 调用 _spawnvp("bash", ...) 来执行命令，
+          #   但 MSYS2 bash 的 PATH 用 POSIX 路径 (/usr/bin)，
+          #   Windows CreateProcess / _spawnvp 不认识 POSIX 路径。
+          #   导致 build/exec 找不到 bash → 静默返回 0 → 所有依赖 build/exec
+          #   的包（ffmpeg, libass, fontconfig 等）的 configure/build/install
+          #   都没真正执行 → 没有 libavcodec.pc → mpv configure 失败。
+          MSYS_ROOT="D:/a/_temp/msys64"
+          if [ ! -d "$MSYS_ROOT/usr/bin" ]; then
+            MSYS_ROOT="/c/msys64"
+          fi
+          if [ -d "$MSYS_ROOT/usr/bin" ]; then
+            export PATH="$MSYS_ROOT/usr/bin:$PATH"
+            echo "V19: Added $MSYS_ROOT/usr/bin to PATH for build/exec PE wrapper"
+            which bash && bash --version | head -1
+          else
+            echo "V19 WARN: Cannot find MSYS2 usr/bin in expected locations"
+          fi
+
+          # V19 DIAG: 验证 build/exec PE wrapper 能否找到 bash 并执行命令
+          EXEC="$SB/build/exec"
+          if [ -f "$EXEC" ]; then
+            echo "==== V19 DIAG: testing build/exec ===="
+            "$EXEC" echo "build/exec works" 2>&1 || echo "V19 DIAG: build/exec failed with rc=$?"
+            echo "==== V19 DIAG: build/exec test done ===="
+          fi
           LOG="$SB/build/ninja-full.log"
           echo "writing full ninja log to $LOG"
           # -j3: 节省内存（Windows runner 是 4 vCPU，留一点给 OS）
