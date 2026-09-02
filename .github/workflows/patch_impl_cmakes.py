@@ -63,37 +63,61 @@ import sys, os, re, pathlib, shlex, shutil
 # script-import time do we fall back to the bare name + hope PATH helps.
 # =========================================================================
 def _resolve_bash_exe() -> str:
-    # 1) Prefer FORWARD-SLASH candidates on disk.  CreateProcess on NT fully
-    #    accepts "/" as a path separator inside absolute paths, AND they need
-    #    NO CMake escape treatment when embedded in set(command "…") strings
-    #    (the only backslash we'd otherwise have to double up is gone).
-    #    GitHub Actions default runner paths first, then local msys64.
+    # V27 CRITICAL: Prefer MINGW32/bin/bash.exe OVER usr/bin/bash.exe.
+    #
+    # Why?  execute_process runs our bash.exe via CreateProcess() from the
+    # mingw cmake.exe (a pure Win32 PE), which inherits the *Windows*
+    # environment block (not MSYS2 bash's POSIX env).  In that context:
+    #   - /usr/bin/bash.exe is the MSYS "Cygwin-style" bash (x86_64-pc-cygwin)
+    #     — its internal path mapping (cygwin mount table) is NOT the same as
+    #     the mingw{32,64} bash launched by the `msys2 {0}` shell wrapper, so
+    #     `. exec.sh`'s `export PATH="/mingw32/bin:…"` resolves to the WRONG
+    #     filesystem locations → every tool (rm, configure, cmake, meson, …)
+    #     returns 127 (command not found) even though the files exist.
+    #   - /mingw32/bin/bash.exe is the native Win32 mingw-w64 bash launcher —
+    #     it initialises the correct MSYSTEM=MINGW32 context, /mingw32/bin
+    #     maps to the same directory that pacman installed all our toolchain
+    #     packages into, and `. exec.sh` exporting `PATH=/mingw32/bin:$PATH`
+    #     therefore resolves i686-gcc / cmake / meson exactly as the upstream
+    #     superbuild's ninja+cmd environment intended.
+    #
+    # Evidence: in logs_91172717506 Step 12, even simple `rm -rf` returned 127
+    # under bash=/usr/bin/bash.exe, while the FINAL-JUDGMENT section showed
+    # /mingw32/bin/{meson,ninja,gcc,i686-gcc,pkg-config} all exist and work.
     candidates_fwd = [
+        # V27: MINGW32 bash first (the whole point of this superbuild fix)
+        r"D:/a/_temp/msys64/mingw32/bin/bash.exe",
+        r"C:/msys64/mingw32/bin/bash.exe",
+        # Fallback 1: UCRT64 mingw bash (still native Win32, better than cygwin)
+        r"D:/a/_temp/msys64/ucrt64/bin/bash.exe",
+        r"C:/msys64/ucrt64/bin/bash.exe",
+        # Fallback 2: MINGW64 bash
+        r"D:/a/_temp/msys64/mingw64/bin/bash.exe",
+        r"C:/msys64/mingw64/bin/bash.exe",
+        # Fallback 3: MSYS /usr/bin bash (Cygwin-style — 127-prone, last resort)
         r"D:/a/_temp/msys64/usr/bin/bash.exe",
         r"C:/msys64/usr/bin/bash.exe",
     ]
     for p in candidates_fwd:
         if os.path.isfile(p):
             return p
-    # 2) Try the backslash variants as a fall-back.  If we land here, the
-    #    caller MUST run _cmake_quote_for_set(token) on it before putting
-    #    the value into a CMake double-quoted string, or CMake will choke on
-    #    Invalid character escape '\a' / '\t' / '\u' etc.
+    # 2) Backslash variants (all mingw first).
     candidates_bs = [
+        r"D:\a\_temp\msys64\mingw32\bin\bash.exe",
+        r"C:\msys64\mingw32\bin\bash.exe",
+        r"D:\a\_temp\msys64\mingw64\bin\bash.exe",
+        r"C:\msys64\mingw64\bin\bash.exe",
         r"D:\a\_temp\msys64\usr\bin\bash.exe",
         r"C:\msys64\usr\bin\bash.exe",
     ]
     for p in candidates_bs:
         if os.path.isfile(p):
             return p
-    # 3) Use shutil.which (respects Python's inherited PATH).
-    #    `bash.exe` is the PE binary name; "bash" as a fallback basename.
+    # 3) shutil.which — MSYS2 setup-msys2 action puts mingw32/bin on PATH
+    #    BEFORE usr/bin in this workflow, so this prefers mingw bash too.
     p = shutil.which("bash.exe") or shutil.which("bash")
     if p:
         return p
-    # 4) Last-resort bare name (rely on PATH at execute_process time, and
-    #    on the caller _cmake_quote_for_set()'ing it — it's a bare word so
-    #    no escaping is actually needed).
     return "bash"
 
 BASH_EXE_ABS = _resolve_bash_exe()
