@@ -143,14 +143,11 @@ for stamp_dir in stamp_dirs:
         pdf_build_re = re.compile(
             r"([;\"'\s]|^)-Dpdf-build=(enabled|disabled|auto|true|false)([;\"'\s]|$)",
         )
-        fixed_count = 0
-        def _count_and_fix(m):
-            nonlocal fixed_count
-            fixed_count += 1
+        def _disable_pdf(m):
             before, _value, after = m.group(1), m.group(2), m.group(3)
             return f"{before}-Dpdf-build=disabled{after}"
-        content_new = pdf_build_re.sub(_count_and_fix, content)
-        if content_new != content:
+        content_new, fixed_count = pdf_build_re.subn(_disable_pdf, content)
+        if fixed_count:
             content = content_new
             print(f"v18.6 FIXED pdf-build: set {fixed_count} occurrence(s) to disabled in {os.path.basename(cmake_file)} (llvm-libcxx dep removed)")
 
