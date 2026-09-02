@@ -45,6 +45,46 @@ the 90% of steps that are PE-safe and already pass).
 import sys, os, re, pathlib, shlex, shutil
 
 # =========================================================================
+# V22/V23 global: resolve bash.exe absolute path ONCE at import time.
+#
+# The CMake execute_process(COMMAND <argv-list>) calls that we rewrite in
+# Strategy 0 are executed by the mingw cmake.exe (native Win32 PE process)
+# inside a `cmd.exe /C "… cmake -P foo.cmake …"` subprocess.  The PE
+# process's PATH block only knows native Windows paths, not POSIX-style
+# `D:/…/usr/bin` mixed paths.  Even when MSYS2 bash sets POSIX PATH, the
+# PE child inherits a partially-converted env block where `/usr/bin/bash`
+# may or may not resolve.  Result: `execute_process(COMMAND bash …)` fails
+# with 127 (command not found) even when the user's interactive shell says
+# `which bash` OK.
+#
+# So instead of emitting bare `"bash"` we emit the ABSOLUTE Windows path to
+# bash.exe (backslashes are fine, forward slashes also work because our
+# CMake callers are mingw cmake on NT).  Only if we cannot resolve it at
+# script-import time do we fall back to the bare name + hope PATH helps.
+# =========================================================================
+def _resolve_bash_exe() -> str:
+    # 1) Standard MSYS2 locations on GitHub Actions runners and local hosts
+    candidates = [
+        r"D:\a\_temp\msys64\usr\bin\bash.exe",
+        r"D:/a/_temp/msys64/usr/bin/bash.exe",
+        r"C:\msys64\usr\bin\bash.exe",
+        r"C:/msys64/usr/bin/bash.exe",
+    ]
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    # 2) Use shutil.which (respects Python's inherited PATH).
+    #    `bash.exe` is the PE binary name; "bash" as a fallback basename.
+    p = shutil.which("bash.exe") or shutil.which("bash")
+    if p:
+        return p
+    # 3) Last-resort bare name (rely on PATH at execute_process time).
+    return "bash"
+
+BASH_EXE_ABS = _resolve_bash_exe()
+
+
+# =========================================================================
 # V20 Strategy 0 helpers — fix build/exec launcher AT THE set(command "...")
 # level so that Strategy 3 (${command} placeholder guard) no longer skips
 # the only calls that actually matter for ffmpeg / libass / fontconfig …
@@ -285,7 +325,7 @@ def _patch_setcommand_buildexec(text: str) -> tuple:
         exec_sh_path = exec_path + ".sh"
         # Rebuild: bash;<exec_sh_path>;<tok1>;<tok2>;…
         # Keep remaining items exactly as they were (no recompose).
-        new_items = ["bash", exec_sh_path] + items[1:]
+        new_items = [BASH_EXE_ABS, exec_sh_path] + items[1:]
         new_inner = ";".join(new_items)
         new_line = f'{prefix}"{new_inner}"{suffix[1:]}'
         count[0] += 1
@@ -1027,9 +1067,9 @@ def main() -> int:
             rel = p.relative_to(build_dir).as_posix()
             extra = f" [S0={s0_count}]" if s0_count else ""
             print(f"   patched: {rel}{extra}")
-    print(f"\nV22 DONE patch_impl_cmakes.py: scanned {count_seen} cmake files, "
-          f"patched {count_patched} (Strategy0 build/exec->exec.sh fixes={count_s0_fixes}), "
-          f"skipped {count_skipped}.")
+    print(f"\nV23 DONE patch_impl_cmakes.py: scanned {count_seen} cmake files, "
+          f"patched {count_patched} (Strategy0 build/exec->bash@abs/exec.sh fixes={count_s0_fixes}), "
+          f"bash resolved to: {BASH_EXE_ABS!r}; skipped {count_skipped}.")
     return 0
 
 
