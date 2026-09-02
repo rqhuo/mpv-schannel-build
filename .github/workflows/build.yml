@@ -19,6 +19,8 @@ name: build-libmpv-i686-schannel
 #   curl:       CURL_USE_OPENSSL=OFF + CURL_USE_SCHANNEL=ON,
 #               drops HTTP/3 (ngtcp2/nghttp3, openssl-only) and libssh
 #   libarchive: ENABLE_OPENSSL=OFF
+#   mpv / mpv-release: drop subrandr (X11-only; upstream hard-panics on
+#               i686-pc-windows-gnu, issue afishhh/subrandr#31) -> -Dsubrandr=disabled
 #   => nothing in the mpv build DAG references the openssl package anymore.
 #      https streaming in mpv goes through Windows' own TLS stack and uses
 #      the system certificate store (no cacert.pem needed).
