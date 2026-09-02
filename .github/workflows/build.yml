@@ -172,35 +172,35 @@ jobs:
           fi
 
           # ---- verification: the DLL must use Schannel, not OpenSSL ----
-          # Use `strings` (always present) to inspect the PE import table and
-          # version strings. We intentionally do NOT rely on the cross
-          # toolchain's objdump (its install path varies / may be absent),
-          # so the verification can never break the artifact upload.
+          # We grep the RAW binary with `grep -a` (treat file as text) instead
+          # of `strings`. Newer GNU `strings` only scans *allocated* sections
+          # by default and SKIPS the PE import table, so it never sees
+          # "Secur32.dll" and would report a false negative on the CI runner.
+          # `grep -a` reads the whole file and is version-independent.
           : > "$OUT/schannel-check.txt"
           {
             echo "libmpv-2.dll size: $(stat -c%s "$OUT/libmpv-2.dll") bytes"
             echo
             echo "OpenSSL version strings inside libmpv-2.dll (expect none):"
-            if strings "$OUT/libmpv-2.dll" | grep -i "OpenSSL [0-9]"; then
+            # A real OpenSSL link leaves a banner like "OpenSSL 1.1.1"/"OpenSSL 3.0.0".
+            # ffmpeg also contains a static message "recompile FFmpeg with openssl, ..."
+            # that has NO version digit right after 'openssl', so this pattern is safe.
+            if grep -aqiE "openssl [0-9]" "$OUT/libmpv-2.dll"; then
               echo "!!! OpenSSL DETECTED - build is NOT schannel-only"
               exit 31
             else
               echo "(none - good)"
             fi
             echo
-            echo "SECUR32.dll referenced (Schannel/SSPI must be used):"
-            if strings "$OUT/libmpv-2.dll" | grep -qi "SECUR32.dll"; then
-              echo "SECUR32.dll referenced - Schannel present (good)"
+            echo "Schannel/SSPI stack referenced (Secur32 + Crypt32 required):"
+            sec=$(grep -aqi "secur32" "$OUT/libmpv-2.dll" && echo yes || echo no)
+            crp=$(grep -aqi "crypt32" "$OUT/libmpv-2.dll" && echo yes || echo no)
+            ncr=$(grep -aqi "ncrypt"  "$OUT/libmpv-2.dll" && echo yes || echo no)
+            if [ "$sec" = "yes" ] && [ "$crp" = "yes" ]; then
+              echo "Secur32.dll + CRYPT32.dll referenced - Schannel present (good) [ncrypt=$ncr]"
             else
-              echo "!!! SECUR32.dll NOT referenced - schannel missing?"
+              echo "!!! Schannel SSPI NOT referenced (secur32=$sec crypt32=$crp) - schannel missing?"
               exit 32
-            fi
-            # optional: full import list via objdump if it happens to exist
-            OBJDUMP=$(find "$B/install/bin" -name '*-objdump' -type f 2>/dev/null | head -1)
-            if [ -n "$OBJDUMP" ]; then
-              echo
-              echo "Imported DLLs (via $OBJDUMP):"
-              "$OBJDUMP" -p "$OUT/libmpv-2.dll" 2>/dev/null | grep "DLL Name" || true
             fi
           } | tee -a "$OUT/schannel-check.txt"
 
