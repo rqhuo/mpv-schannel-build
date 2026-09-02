@@ -132,6 +132,14 @@ jobs:
 
       - name: Build mpv (target ${{ env.MPV_TARGET }})
         run: |
+          # Force a clean (re)configure of the mpv target. The superbuild
+          # caches the whole tree between runs; a previously failed configure
+          # can leave a half-initialised meson build dir that makes `meson
+          # setup` choke on the next attempt. Wipe only this target's prefix
+          # so it rebuilds from scratch while every other package (ffmpeg,
+          # the cross toolchain, ...) is reused from cache.
+          rm -rf "mpv-winbuild/build/packages/mpv-release-prefix" \
+                 "mpv-winbuild/build/packages/mpv-prefix"
           ninja -C mpv-winbuild/build "$MPV_TARGET"
 
       - name: Collect artifacts + verify Schannel build
