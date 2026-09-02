@@ -811,7 +811,7 @@ def main() -> int:
             extra = f" [S0={s0_count}]" if s0_count else ""
             print(f"   patched: {rel}{extra}")
     print(f"\nV20 DONE patch_impl_cmakes.py: scanned {count_seen} cmake files, "
-          f"patched {count_patched} (Strategy0 build/exec→bash fixes={count_s0_fixes}), "
+          f"patched {count_patched} (Strategy0 build/exec->bash fixes={count_s0_fixes}), "
           f"skipped {count_skipped}.")
     return 0
 
