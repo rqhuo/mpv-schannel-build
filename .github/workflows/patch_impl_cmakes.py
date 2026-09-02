@@ -458,29 +458,35 @@ def _patch_setcommand_buildexec(text: str) -> tuple:
                 #            ;    → list separator  WHEN not in_q AND not \-escaped
                 #            Any other char → literal.
                 #
-                # We need to produce the original kScript, containing both " and
-                # ; characters — which each have special meaning in Layer 2.
-                # We therefore pre-escape the raw K_SCRIPT token for Layer 2:
-                #   A1)  ;  →  \;     (always literal semicolon in CMake lists)
-                #   A2)  "  →  \"     (literal double-quote, not in_q toggle)
-                # The $ @ % { } ( ) characters in kScript are inert for both
-                # layers — CMake doesn't expand anything inside a plain
-                # set(command "...") value unless ${var} is there, which our
-                # script does not contain (all $ are inside literal bash strings).
-                esc = tok
-                esc = esc.replace(";", "\\;")    # Step 2: \; → literal ;
-                esc = esc.replace('"', '\\"')   # Step 2: \" → literal " (no toggle)
-                # Now apply the Layer 1 DQ escaping that _cmake_quote_for_set
-                # provides:  '\' → '\\', '"' → '\"'
-                esc = _cmake_quote_for_set(esc)
+                # V26 FIX: K_SCRIPT contains "${_CMD[@]}" which CMake's L1 DQ
+                # parser tries to interpolate as ${_CMD[@]} → "Invalid character
+                # ('[') in a variable name: '_CMD'".
                 #
-                # Tracing the whole pipeline through cmake.exe:
-                #   Raw char   After A1/A2   After _cmake_qfs   L1 parse → list   L2 parse → argv[2]
-                #   ;          \;             \\;                \;                  ;
-                #   "          \"             \\\"              \"                 "
-                #   \ (none)   \-escaped was  N/A                 \                  \
-                # So the final bash -c script arg equals the original static
-                # const char kScript[] in exec_wrapper.c  — exact match.
+                # We keep V25's 3-step pipeline for ; and " (which correctly
+                # produces \\; and \\\" in the CMake file), and add a 4th step
+                # for ${ AFTER _cmake_quote_for_set.
+                #
+                # Why AFTER? _cmake_quote_for_set doubles ALL backslashes. If we
+                # did ${ → \${ before it, we'd get \\${ in the file, and L1
+                # would parse \\ → \ (literal), leaving ${_CMD[@]} to trigger
+                # interpolation again. By doing it after, the \ we add is NOT
+                # doubled, so the file contains \${, and L1 parses \$ → $ (literal
+                # dollar), preventing ${var} interpolation.
+                #
+                # Full trace for the K_SCRIPT token through all 4 steps:
+                #
+                #   raw char  step1(;→\;)  step2("→\")  step3(_qfs)   step4(${→\${)  CMake file  → L1 → L2 → argv
+                #   ;         \;           \;           \\;           \\;            \\;         \;   ;    ;
+                #   "         "            \"           \\\"          \\\"           \\\"        \"   "    "
+                #   ${        ${           ${           ${            \${            \${         ${   ${   ${
+                #
+                # L1 DQ parse rules: \\ → \, \" → ", \$ → $, \X → \X (preserved)
+                # L2 list parse rules: \; → literal ;, \" → literal ", \X → X
+                esc = tok
+                esc = esc.replace(";", "\\;")    # Step 1: ; → \;  (pre-escape for L2)
+                esc = esc.replace('"', '\\"')   # Step 2: " → \"  (pre-escape for L2)
+                esc = _cmake_quote_for_set(esc)  # Step 3: \ → \\, " → \"  (L1 DQ escape)
+                esc = esc.replace("${", "\\${")  # Step 4: ${ → \${  (THE FIX — after _qfs so \ is NOT doubled)
             else:
                 esc = _cmake_quote_for_set(tok)
             quoted_items.append(esc)
