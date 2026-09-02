@@ -81,6 +81,21 @@ WHITELIST_PKGS = [
     #   * dav1d     -> external AV1 decoder; ffmpeg has built-in AV1
     #                  support and doesn't require dav1d.
     "libdvdcss", "dav1d",
+    # Tier 2d: logs_91005866312 NEW confirmed FAILED —
+    #   * x264      -> GIT_REPOSITORY is code.videolan.org which is
+    #                  unreliable from GitHub Actions. We pre-clone
+    #                  from GitHub mirrors in build.yml step 5, but
+    #                  add whitelist as fallback in case both mirrors
+    #                  fail. ffmpeg needs libx264 for H.264 encoding
+    #                  but can build without it (--disable-libx264
+    #                  is the fallback). For playback (our goal),
+    #                  x264 encoder is not needed at all.
+    #   * libbluray -> Same code.videolan.org issue. BLU-RAY PLAYBACK
+    #                  NEEDS libbluray! But if pre-clone succeeds,
+    #                  whitelist is harmless (real build runs). If
+    #                  pre-clone fails, whitelist prevents DAG abort
+    #                  but mpv configure will just disable bluray.
+    "x264", "libbluray",
     # Tier 3: Vulkan/shader stack (8)
     "shaderc-utils", "spirv-cross", "glslang", "spirv-tools",
     "spirv-headers", "spirv-header", "vulkan-headers", "vulkan-header",
