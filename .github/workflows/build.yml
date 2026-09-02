@@ -42,8 +42,8 @@ on:
         default: 'mpv-release'
         type: choice
         options:
-          - mpv-release   # latest stable tarball (recommended)
-          - mpv           # git master
+          - mpv-release
+          - mpv
   push:
     branches: [main]
     paths:
