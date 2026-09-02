@@ -230,18 +230,37 @@ def _find_setcommand_boundary(line: str):
 def _patch_setcommand_buildexec(text: str) -> tuple:
     """Replace every line containing
          set(command "D:/…/build/exec;tok1;tok2;…")
-    (with arbitrary embedded double-quote content inside args) by
-         set(command "bash;-lc;<recomposed-shell-string>")
+    by
+         set(command "bash;D:/…/build/exec.sh;tok1;tok2;…")
 
     Returns (new_text, replacement_count).
 
-    V21 changes (see also bash_recompose above):
-      * Replaced the regex parser with a char-level scanner
-        `_find_setcommand_boundary()` because the previous `[^"]*` inner
-        capture could not match CMake COMMAND strings whose arguments carry
-        embedded "…" wrappers (like `-DCMAKE_C_FLAGS="-O2 -g"`).
-      * Item splitter switched from str.split(";") to the quote-aware
-        `_cmake_split_args()` helper.
+    V22 (THIS VERSION) — critical fix for "Command failed: 127":
+    -----------------------------------------------------------------
+    The original build/exec is a bash script (exec.sh after PE-wrapping)
+    that sets critical environment variables BEFORE running the command:
+
+        export PATH="/bin:…/.cargo/bin:$PATH"
+        export PKG_CONFIG="pkgconf --static"
+        export PKG_CONFIG_LIBDIR="/i686/lib/pkgconfig"
+        export RUSTUP_HOME="…"
+        export CARGO_HOME="…"
+        eval $*
+
+    V20/V21 replaced build/exec with `bash;-lc;<recomposed-shell-string>`,
+    which bypassed exec.sh entirely → NO env setup → every configure step
+    returned 127 (command not found) or 1 (missing PKG_CONFIG_PATH etc.).
+
+    V22 fix: instead of recomposing into a single `bash -lc` string, simply
+    replace the build/exec token with `bash;<exec_sh_path>` and KEEP the
+    original semicolon-separated argument list intact.  This way CMake's
+    `execute_process(COMMAND ${command})` calls:
+
+        bash  D:/…/build/exec.sh  tok1  tok2  tok3  …
+
+    which is EXACTLY what the original PE wrapper did (find bash.exe → run
+    exec.sh with the same argv).  exec.sh sets up the environment and then
+    `eval $*` runs the command.  No quoting/recomposition needed at all.
     """
     count = [0]
     lines = text.split("\n")
@@ -252,19 +271,23 @@ def _patch_setcommand_buildexec(text: str) -> tuple:
             new_lines.append(line)
             continue
         prefix, inner, suffix = bound
-        # Quick reject without allocations: inner must start with build/exec.
-        # (Need to split to grab tokens[0] robustly for the quoted-path case.)
         items = _cmake_split_args(inner)
         if not items or not _is_build_exec_token(items[0]):
             new_lines.append(line)
             continue
-        rest = items[1:]
-        if not rest:
-            shell_cmd = "true"
-        else:
-            shell_cmd = bash_recompose(rest)
-        new_inner = "bash;-lc;" + _cmake_quote_for_set(shell_cmd)
-        new_line = f"{prefix}\"{new_inner}\"{suffix[1:]}"  # suffix already starts with the closing outer "
+        # Derive exec.sh path: same as build/exec but with .sh appended.
+        # _is_build_exec_token already stripped outer quotes, so items[0]
+        # is the raw path.  We need to handle both quoted and unquoted cases.
+        exec_path = items[0].strip()
+        # Strip surrounding quotes if present
+        if len(exec_path) >= 2 and exec_path[0] == '"' and exec_path[-1] == '"':
+            exec_path = exec_path[1:-1]
+        exec_sh_path = exec_path + ".sh"
+        # Rebuild: bash;<exec_sh_path>;<tok1>;<tok2>;…
+        # Keep remaining items exactly as they were (no recompose).
+        new_items = ["bash", exec_sh_path] + items[1:]
+        new_inner = ";".join(new_items)
+        new_line = f'{prefix}"{new_inner}"{suffix[1:]}'
         count[0] += 1
         new_lines.append(new_line)
     return "\n".join(new_lines), count[0]
@@ -1004,8 +1027,8 @@ def main() -> int:
             rel = p.relative_to(build_dir).as_posix()
             extra = f" [S0={s0_count}]" if s0_count else ""
             print(f"   patched: {rel}{extra}")
-    print(f"\nV20 DONE patch_impl_cmakes.py: scanned {count_seen} cmake files, "
-          f"patched {count_patched} (Strategy0 build/exec->bash fixes={count_s0_fixes}), "
+    print(f"\nV22 DONE patch_impl_cmakes.py: scanned {count_seen} cmake files, "
+          f"patched {count_patched} (Strategy0 build/exec->exec.sh fixes={count_s0_fixes}), "
           f"skipped {count_skipped}.")
     return 0
 
