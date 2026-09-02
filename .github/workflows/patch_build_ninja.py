@@ -73,6 +73,14 @@ WHITELIST_PKGS = [
     #                    x265 binaries. Default 8-bit x265 builds and
     #                    installs fine; ffmpeg only needs the 8-bit one.
     "llvm-libcxx", "x265-8+10bit", "x265-8+10+12bit",
+    # Tier 2c: logs_91002009653 NEW confirmed FAILED — git clone
+    # (download step) fails because SINGLE_SOURCE_LOCATION didn't
+    # pre-populate these two repos. Both are optional for our goal:
+    #   * libdvdcss -> DVD CSS decryption only; dvdnav/dvdread work
+    #                  without it (user's DVD ISO isn't CSS-encrypted).
+    #   * dav1d     -> external AV1 decoder; ffmpeg has built-in AV1
+    #                  support and doesn't require dav1d.
+    "libdvdcss", "dav1d",
     # Tier 3: Vulkan/shader stack (8)
     "shaderc-utils", "spirv-cross", "glslang", "spirv-tools",
     "spirv-headers", "spirv-header", "vulkan-headers", "vulkan-header",
