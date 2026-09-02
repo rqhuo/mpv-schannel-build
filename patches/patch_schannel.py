@@ -30,17 +30,18 @@ What it does (all changes are plain text replacements, verified one by one):
       - ENABLE_OPENSSL=OFF (zip/LZMA crypto falls back to Windows Crypto API)
 
   packages/mpv.cmake  AND  packages/mpv-release.cmake
-      - DEPENDS: drop `subrandr`
-        subrandr's upstream build script hard-panics on i686-pc-windows-gnu
-        ("Building for i686-pc-windows-gnu is currently known to be broken!",
-        issue afishhh/subrandr#31). It is an X11 RandR substitute and is NOT
-        used by mpv on native Windows at all, so we drop it for this 32-bit
-        build. NOTE: the stable mpv release we build (v0.41.0) has NO
-        `subrandr` meson option at all, so we must REMOVE the
-        `-Dsubrandr=enabled` line entirely (changing it to `=disabled`
-        would itself be rejected as an "Unknown option"). With subrandr
-        removed from DEPENDS, pkg-config won't find it and mpv simply
-        builds without it.
+      - DEPENDS: drop `subrandr` and `vapoursynth`
+        * subrandr: upstream build script hard-panics on i686-pc-windows-gnu
+          ("Building for i686-pc-windows-gnu is currently known to be broken!",
+          issue afishhh/subrandr#31). It is an X11 RandR substitute, unused
+          on native Windows. The stable mpv release (v0.41.0) has NO
+          `subrandr` meson option, so the `-Dsubrandr=enabled` line must be
+          REMOVED entirely (setting it to `=disabled` is rejected as unknown).
+        * vapoursynth: its 32-bit (i686) import lib does not export the
+          stdcall-mangled `getVSScriptAPI@4` symbol, so linking mpv.exe /
+          libmpv-2.dll fails with "undefined reference to _imp__getVSScriptAPI@4".
+          VapourSynth is an advanced scripting-filter feature, not needed for
+          DVD / video playback, so we disable it for this 32-bit build.
 
 After patching, nothing in the mpv / mpv-release build DAG references the
 openssl ExternalProject anymore, so libmpv-2.dll and mpv.exe link NO OpenSSL
@@ -171,6 +172,24 @@ REPLACEMENTS = [
      "        -Dsubrandr=enabled\n",
      "",
      1),
+    # vapoursynth: 32-bit import lib lacks getVSScriptAPI@4 -> link fails.
+    # Disable it for this 32-bit build (advanced scripting filter, not needed).
+    ("packages/mpv-release.cmake",
+     "        vapoursynth\n",
+     "",
+     1),
+    ("packages/mpv-release.cmake",
+     "        -Dvapoursynth=enabled\n",
+     "        -Dvapoursynth=disabled\n",
+     1),
+    ("packages/mpv.cmake",
+     "        vapoursynth\n",
+     "",
+     1),
+    ("packages/mpv.cmake",
+     "        -Dvapoursynth=enabled\n",
+     "        -Dvapoursynth=disabled\n",
+     1),
 ]
 
 # Files where, after patching, no reference to the dropped packages / openssl
@@ -192,6 +211,9 @@ FORBIDDEN_DEPEND_LINES = [
     # subrandr must be gone from the mpv build (X11-only, broken on i686)
     ("packages/mpv.cmake", "subrandr"),
     ("packages/mpv-release.cmake", "subrandr"),
+    # vapoursynth must be gone from the mpv build (i686 link failure)
+    ("packages/mpv.cmake", "vapoursynth"),
+    ("packages/mpv-release.cmake", "vapoursynth"),
 ]
 
 
