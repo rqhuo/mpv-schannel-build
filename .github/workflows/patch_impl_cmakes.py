@@ -410,11 +410,62 @@ def _patch_setcommand_buildexec(text: str) -> tuple:
         #   wrapper, but with BASH_EXE_ABS as the PE entrypoint (absolute
         #   path → guaranteed executable findability even if Windows-PATH
         #   PATH in the caller is mangled).
+        # V28: Derive MSYS2 install root from BASH_EXE_ABS, then prepend the
+        # mingw32/bin directory (Windows forward-slash absolute path) to PATH
+        # BEFORE sourcing exec.sh.
+        #
+        # Why?  BASH_EXE_ABS is /usr/bin/bash.exe (the MSYS/Cygwin runtime).
+        # When CreateProcess launches it directly from a Win32 caller (cmake.exe
+        # → cmd.exe → cmake -P foo.cmake), there is NO msys2.cmd wrapper,
+        # MSYSTEM environment variable is unset, and Cygwin bash's mount table
+        # therefore has no /mingw32 entry mapped to the mingw32 install dir.
+        # Result: `. exec.sh` exporting `PATH="/mingw32/bin:…"` resolves to a
+        # non-existent directory → every call returns 127.
+        #
+        # Using a REAL Windows absolute path like
+        #   D:/a/_temp/msys64/mingw32/bin
+        # bypasses Cygwin mount table translation entirely — both MSYS runtime
+        # bash.exe AND CreateProcess know how to resolve it, so `which gcc`
+        # resolves to the actual file we installed via pacman.
+        #
+        # MSYS2 root = directory containing usr/bin that contains bash.exe:
+        #   bash= D:/a/_temp/msys64/usr/bin/bash.exe  →  root= D:/a/_temp/msys64
+        # Derive it once per line (cheap, and keeps module-level stat logic
+        # intact for the BASH_EXE_ABS value that may vary between dev boxes).
+        import os as _os
+        _bash_abs_norm = BASH_EXE_ABS.replace("\\", "/")
+        _mingw32_bin = None
+        _usr_bin_idx = _bash_abs_norm.rfind("/usr/bin/")
+        if _usr_bin_idx > 0 and _bash_abs_norm.endswith("/bash.exe"):
+            _msys_root = _bash_abs_norm[:_usr_bin_idx]  # e.g. D:/a/_temp/msys64
+            _mingw32_bin = _msys_root + "/mingw32/bin"
+            _mingw64_bin = _msys_root + "/mingw64/bin"
+        else:
+            _mingw32_bin = None
+        _prelude = ""
+        if _mingw32_bin:
+            # V28 PATH prepend: mingw32 first (our i686 toolchain lives here),
+            # then mingw64 (common host tools that some configure scripts look
+            # for even on 32-bit), then /usr/bin (msys coreutils — they resolve
+            # correctly because we ARE running the usr/bin bash.exe and its
+            # mount table always has /usr → /usr).
+            # Also set MSYSTEM=MINGW32 so any subsequent `bash -lc` or env-
+            # sniffing tool (autotools config.sub) sees the same context that
+            # the workflow's `shell: msys2 {0}` provides.
+            _prelude = (
+                'export MSYSTEM=MINGW32; '
+                f'PATH="{_mingw32_bin}'
+            )
+            # mingw64 if present (harmless if directory doesn't actually exist)
+            if _mingw64_bin:
+                _prelude += f':{_mingw64_bin}'
+            _prelude += ':/usr/bin:$PATH"; export PATH; '
         K_SCRIPT = (
-            '_CMD=("$@"); '
-            'set --; '
-            '. "$0"; '
-            'eval "$(printf \' %q\' "${_CMD[@]}")"'
+            _prelude
+            + '_CMD=("$@"); '
+            + 'set --; '
+            + '. "$0"; '
+            + 'eval "$(printf \' %q\' "${_CMD[@]}")"'
         )
         new_items = [BASH_EXE_ABS, "-c", K_SCRIPT, exec_sh_path] + items[1:]
         # SAFETY: Every token going back into the CMake set(command "…")
