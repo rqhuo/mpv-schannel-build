@@ -44,6 +44,64 @@ the 90% of steps that are PE-safe and already pass).
 
 import sys, os, re, pathlib, shlex, shutil
 
+# =========================================================================
+# V20 Strategy 0 helpers — fix build/exec launcher AT THE set(command "...")
+# level so that Strategy 3 (${command} placeholder guard) no longer skips
+# the only calls that actually matter for ffmpeg / libass / fontconfig …
+# =========================================================================
+
+def _is_build_exec_token(tok: str) -> bool:
+    """Return True if tok is the superbuild's build/exec PE wrapper path."""
+    if not tok:
+        return False
+    t = tok.strip()
+    if len(t) >= 2 and t[0] == '"' and t[-1] == '"':
+        t = t[1:-1]
+    t_low = t.lower().replace("\\", "/").rstrip(".exe")
+    return t_low.endswith("/build/exec")
+
+
+def _cmake_quote_for_set(s: str) -> str:
+    """Escape a shell-command string so it can safely live inside
+    CMake's outer set(command "…") double-quoted value.
+
+    In CMake double-quoted strings:  \\ → literal backslash,  \" → literal ".
+    Dollar-sign expansions like ${FOO} would fire but our shell commands
+    don't contain them (bash_recompose uses single-quoted argv tokens).
+    """
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _patch_setcommand_buildexec(text: str) -> tuple:
+    """Replace every line matching
+         set(command "D:/…/build/exec;tok1;tok2;…")
+    with
+         set(command "bash;-lc;<recomposed-shell-string>")
+
+    Returns (new_text, replacement_count).
+    """
+    pat = re.compile(r'^(\s*set\s*\(\s*command\s*")([^"]*)("\s*\)\s*)$', re.MULTILINE)
+    count = [0]  # mutable int wrapper for closure
+
+    def _sub(m):
+        prefix = m.group(1)
+        inner = m.group(2)
+        suffix = m.group(3)
+        items = inner.split(";")
+        if not items or not _is_build_exec_token(items[0]):
+            return m.group(0)
+        rest = items[1:]
+        if not rest:
+            shell_cmd = "true"
+        else:
+            shell_cmd = bash_recompose(rest)
+        new_inner = "bash;-lc;" + _cmake_quote_for_set(shell_cmd)
+        count[0] += 1
+        return f"{prefix}{new_inner}{suffix}"
+
+    result = pat.sub(_sub, text)
+    return result, count[0]
+
 SAFE_BARE_NAMES = {
     # CMake family
     "cmake", "cmake.exe", "cpack", "cpack.exe", "ctest", "ctest.exe",
@@ -158,12 +216,27 @@ def bash_recompose(tokens):
         inner = s.replace("'", "'\\''")
         return f"'{inner}'"
     pieces = []
-    for t in tokens:
+    # ---- V20 Phase A: leading NAME=VALUE tokens → bash env assignments.
+    #      MUST emit without quoting, otherwise `'CONF=1'` becomes a
+    #      literal argv[0] string instead of `CONF=1 cmd …` prefix form.
+    _ENV_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
+    idx = 0
+    while idx < len(tokens):
+        t = tokens[idx]
+        core = t
+        if len(core) >= 2 and core[0] == '"' and core[-1] == '"':
+            core = core[1:-1]
+        if _ENV_RE.match(core):
+            pieces.append(core)  # emit VERBATIM (env-prefix form)
+            idx += 1
+        else:
+            break
+    # ---- Phase B: everything else → shell-quoted (or verbatim SHELL_OPS)
+    for t in tokens[idx:]:
         core = t
         if len(core) >= 2 and core[0] == '"' and core[-1] == '"':
             core = core[1:-1]
         if core in SHELL_OPS:
-            # Shell operator / redirect: emit verbatim without quoting.
             pieces.append(core)
         else:
             pieces.append(q(t))
@@ -652,12 +725,46 @@ def main() -> int:
     if not build_dir.is_dir():
         print(f"[FATAL] build dir not found: {build_dir}", file=sys.stderr)
         return 3
-    # Find every --impl.cmake file ever generated anywhere under build/
+    # ------------------------------------------------------------------
+    # V20: Expand candidate scope.  The previous scan only covered
+    #   *--impl.cmake  files (362), but the build.ninja steps actually
+    #   invoke the NON-impl  *-<step>-.cmake  wrappers (e.g.
+    #   ffmpeg-configure-.cmake) which ALSO contain
+    #       set(command "…/build/exec;…")   +   execute_process(COMMAND ${command})
+    #   The Strategy 3 `${command}` placeholder guard SKIPS all of these
+    #   because the argv list has a single "${command}" element, leaving
+    #   build/exec in command → every configure/build/install returns 0
+    #   silently without doing any real work.
+    # Fix:  scan every .cmake under  **/*-stamp/  AND every
+    #   **/*-stamp/**/*--impl.cmake  (i.e. the union of old scope + new
+    #   stamp-dir-scope).
+    # ------------------------------------------------------------------
+    seen_paths = set()
+    all_files = []
+    # Old scope: all --impl.cmake anywhere under build/
+    for p in build_dir.rglob("*--impl.cmake"):
+        try:
+            rp = p.resolve()
+        except OSError:
+            continue
+        if rp not in seen_paths:
+            seen_paths.add(rp)
+            all_files.append(p)
+    # V20 new scope: any *.cmake directly under a *-stamp/ directory
+    for p in build_dir.rglob("*-stamp/*.cmake"):
+        try:
+            rp = p.resolve()
+        except OSError:
+            continue
+        if rp not in seen_paths:
+            seen_paths.add(rp)
+            all_files.append(p)
+    all_files.sort()
     count_patched = 0
+    count_s0_fixes = 0
     count_seen = 0
     count_skipped = 0
-    all_files = list(sorted(build_dir.rglob("*--impl.cmake")))
-    print(f"scanning {len(all_files)} candidate *--impl.cmake files under {build_dir}")
+    print(f"V20: scanning {len(all_files)} candidate cmake files (*--impl.cmake + *-stamp/*.cmake) under {build_dir}")
     for p in all_files:
         if not p.is_file():
             continue
@@ -672,16 +779,26 @@ def main() -> int:
             print(f"[SKIP:read] {p}: {e}", file=sys.stderr)
             count_skipped += 1
             continue
-        if "execute_process" not in src:
+        if "execute_process" not in src and "set(command " not in src:
             continue
+        # ---- V20 Strategy 0 FIRST — rewrite set(command "build/exec;…")
+        #      so that Strategy 3 ${command} guard downstream no longer
+        #      prevents wrapping.
+        dst, s0_count = _patch_setcommand_buildexec(src)
+        changed = (dst != src)
+        count_s0_fixes += s0_count
+        # ---- Fallback to Strategy 1/2 (execute_process-level rewriting)
+        #      for any COMMAND that Strategy 0 did not cover.
         try:
-            dst = patch_execute_process(src, filename_for_context=str(p))
+            dst2 = patch_execute_process(dst, filename_for_context=str(p))
         except Exception as e:
-            # Never let a single malformed impl.cmake kill the whole build.
             print(f"[SKIP:parse] {p}: {type(e).__name__}: {e}", file=sys.stderr)
             count_skipped += 1
             continue
-        if dst != src:
+        if dst2 != dst:
+            changed = True
+            dst = dst2
+        if changed:
             try:
                 # Write via bytes to avoid Windows newlines mangling CMake args.
                 p.write_bytes(dst.encode("utf-8"))
@@ -691,9 +808,11 @@ def main() -> int:
                 continue
             count_patched += 1
             rel = p.relative_to(build_dir).as_posix()
-            print(f"   patched: {rel}")
-    print(f"\nDONE patch_impl_cmakes.py: scanned {count_seen} *--impl.cmake files, "
-          f"patched COMMAND in {count_patched}, skipped {count_skipped}.")
+            extra = f" [S0={s0_count}]" if s0_count else ""
+            print(f"   patched: {rel}{extra}")
+    print(f"\nV20 DONE patch_impl_cmakes.py: scanned {count_seen} cmake files, "
+          f"patched {count_patched} (Strategy0 build/exec→bash fixes={count_s0_fixes}), "
+          f"skipped {count_skipped}.")
     return 0
 
 
