@@ -338,18 +338,152 @@ def _patch_setcommand_buildexec(text: str) -> tuple:
         if len(exec_path) >= 2 and exec_path[0] == '"' and exec_path[-1] == '"':
             exec_path = exec_path[1:-1]
         exec_sh_path = exec_path + ".sh"
-        # Rebuild: bash;<exec_sh_path>;<tok1>;<tok2>;…
-        # Keep remaining items exactly as they were (no recompose).
-        new_items = [BASH_EXE_ABS, exec_sh_path] + items[1:]
+        # ================================================================
+        # V25: Use bash -c <kScript> <exec.sh_path> <user_tokens...> form,
+        #   which is 100% semantically equivalent to exec_wrapper.c.
+        # ================================================================
+        #   Why not just `bash exec.sh user_tokens...`?
+        #     Because that's "bash SCRIPT_MODE", where:
+        #       $0 = exec.sh
+        #       $1 = CONF=1  (if that was first user token)
+        #     Then `eval $*` inside exec.sh expands positional params as
+        #     CONF=1 D:/configure --host=... which *looks* right but:
+        #       (a) the superbuild uses command-shapes like:
+        #           cd <dir> && CONF=1 ./configure
+        #           CONF=1 'cmake' '-H…'
+        #           where `cd` / `&&` / CONF=1 were originally executed in a
+        #           bash invocation via the PE wrapper's quoted shell script
+        #           `_CMD=("$@"); set --; . "$0"; eval "$(printf ' %q' …)"`
+        #           — this handles shell compound statements + env prefixes +
+        #           shell builtins (argv[0]=cd which has no corresponding PE)
+        #           — the simple SCRIPT_MODE `exec.sh eval $*` fails for them.
+        #       (b) evidence: in logs_91151348466, Step 12 V24 DIAG:
+        #             "$EXEC" echo "build/exec works" → OUT is empty but rc=0.
+        #           The PE wrapper's `_spawnvp("bash", …)` → stdout capture
+        #           via $() returned blank.  And S0-rewritten libiconv/brotli
+        #           returned 127/1 from the same script-mode invocation.
+        #   So we mirror exec_wrapper.c's exact argv layout:
+        #     [0]  BASH_EXE_ABS                   absolute D:/…/bash.exe
+        #     [1]  -c                             bash option
+        #     [2]  kScript                        (same as exec_wrapper.c:
+        #                                           _CMD=("$@"); set --; . "$0";
+        #                                           eval "$(printf ' %q' …)")
+        #     [3]  exec.sh_path                    → fills $0 in -c mode
+        #     [4+] original user tokens            → fills $1, $2, …
+        #   This means:
+        #     _CMD=("$@")  → _CMD exactly = the original <user_token list>
+        #     set --       → clear $1 $2 so `. exec.sh`'s trailing `eval $*`
+        #                    is empty (as exec_wrapper.c always intended).
+        #     . "$0"       → source exec.sh into the same shell (PATH/PKG_CONFIG
+        #                    / RUSTUP_HOME etc. now apply for the eval below).
+        #     eval "$(printf ' %q' "${_CMD[@]}")"
+        #                  → every user token is round-tripped through bash
+        #                    %q quoting → spaces/shell specials survive as a
+        #                    single argv word; cd/&&/CONF=1 become shell syntax
+        #                    again because eval re-parses the composed line.
+        #
+        #   This gives byte-for-byte identical runtime behaviour to the PE
+        #   wrapper, but with BASH_EXE_ABS as the PE entrypoint (absolute
+        #   path → guaranteed executable findability even if Windows-PATH
+        #   PATH in the caller is mangled).
+        K_SCRIPT = (
+            '_CMD=("$@"); '
+            'set --; '
+            '. "$0"; '
+            'eval "$(printf \' %q\' "${_CMD[@]}")"'
+        )
+        new_items = [BASH_EXE_ABS, "-c", K_SCRIPT, exec_sh_path] + items[1:]
         # SAFETY: Every token going back into the CMake set(command "…")
-        # outer double-quote must have '\' and '"' escaped.  Without this, a
-        # backslash-absolute bash path like `D:\a\_temp\…\bash.exe` is parsed
-        # by cmake.exe -P as '\a' (BEL), '\t' (TAB), '\u…' (unicode), etc. →
-        #   Syntax error in cmake code …  Invalid character escape '\a'.
-        # Strategy 0 之前「items = 分号」切分开时原样保留了 token 内的
-        # CMake 字面转义，这里我们反向把每个 token 单独过一遍
-        # _cmake_quote_for_set（分号本身不是 CMake DQ 里的转义，安全）。
-        quoted_items = [_cmake_quote_for_set(tok) for tok in new_items]
+        # outer double-quote must have '\' and '"' escaped.  kScript contains
+        # single-quotes + $ @ parens which are NOT CMake-escape sequences,
+        # but the embedded " inside ${_CMD[@]} / "$0" / printf string all
+        # need \" escaping via _cmake_quote_for_set.
+        #
+        # EXTRA SAFETY for the K_SCRIPT token: it contains literal ';'
+        # characters between the four shell statement fragments:
+        #   '_CMD=("$@"); set --; . "$0"; eval "$(printf …)"'
+        # In CMake list values (";" is the separator inside set(command "…")'s
+        # outer double-quote), a naked ';' would split it into multiple argv
+        # entries → bash would see fragment 1 as the -c script and fragments
+        # 2..4 become positional args, completely breaking the intended shell
+        # program.  A previous attempt to wrap it with explicit \"...\" list
+        # quotes failed because kScript *internally* contains `"$@"`, `"$0"`,
+        # and `"$(printf …)"`, whose literal `"` chars close and reopen the
+        # list-level quoting region, re-exposing the internal `;`s to
+        # splitting.
+        #
+        # The correct fix: in CMake lists, `\;` is ALWAYS a literal semicolon
+        # (it never triggers list splitting), regardless of whether list
+        # parsing currently considers itself inside an element-level "…"
+        # quote or not.  So we replace every `;` inside K_SCRIPT with `\;`
+        # BEFORE running _cmake_quote_for_set (which doubles `\` and escapes
+        # `"` inside the outer set(command "…") double-quote context).  The
+        # whole per-token pipeline is:
+        #
+        #   K_SCRIPT:            foo; bar
+        #   replace(";", "\\;"): foo\; bar
+        #   _cmake_quote_for_set: foo\\\; bar        (\→\\, \;→\\;, "→\")
+        #   → written into set(command "..."):  INNER contains  foo\\\; bar
+        #
+        #   CMake DQ parse: \\\;  →  literal  \;   (\\→\, \;→\;)  →  we have \;
+        #   CMake list split:  \;  →  literal  ;   →  one argv:   "foo; bar"
+        #
+        # The embedded quotes `… \"…\"` inside the token likewise survive
+        # through the same two steps as literal `"` characters on the list
+        # string (the only place they could accidentally toggle a `\;` escape
+        # would be immediately adjacent, and in our script they're not).
+        quoted_items = []
+        for tok in new_items:
+            if tok is K_SCRIPT:
+                #
+                # K_SCRIPT must survive two independent CMake escape layers
+                # and come out the far end as an argv byte-for-byte identical
+                # to exec_wrapper.c's static const char kScript[]:
+                #
+                #   _CMD=("$@"); set --; . "$0"; eval "$(printf ' %q' "${_CMD[@]}")"
+                #
+                # The two CMake escape layers are:
+                #
+                #  [Layer 1] Outer set(command "...") CMake double-quote context
+                #            (DQ parse):
+                #            \\   → literal '\'
+                #            \"   → literal '"'
+                #            \X   → literal '\' + 'X' for unknown X (kept)
+                #            Any other chars through unchanged.
+                #
+                #  [Layer 2] CMake list-value parsing of the *unescaped* string
+                #            produced by Layer 1:
+                #            "    → toggle in_q, produces NO output
+                #            \X   → literal X (consumes 2 chars, emits 1)
+                #            ;    → list separator  WHEN not in_q AND not \-escaped
+                #            Any other char → literal.
+                #
+                # We need to produce the original kScript, containing both " and
+                # ; characters — which each have special meaning in Layer 2.
+                # We therefore pre-escape the raw K_SCRIPT token for Layer 2:
+                #   A1)  ;  →  \;     (always literal semicolon in CMake lists)
+                #   A2)  "  →  \"     (literal double-quote, not in_q toggle)
+                # The $ @ % { } ( ) characters in kScript are inert for both
+                # layers — CMake doesn't expand anything inside a plain
+                # set(command "...") value unless ${var} is there, which our
+                # script does not contain (all $ are inside literal bash strings).
+                esc = tok
+                esc = esc.replace(";", "\\;")    # Step 2: \; → literal ;
+                esc = esc.replace('"', '\\"')   # Step 2: \" → literal " (no toggle)
+                # Now apply the Layer 1 DQ escaping that _cmake_quote_for_set
+                # provides:  '\' → '\\', '"' → '\"'
+                esc = _cmake_quote_for_set(esc)
+                #
+                # Tracing the whole pipeline through cmake.exe:
+                #   Raw char   After A1/A2   After _cmake_qfs   L1 parse → list   L2 parse → argv[2]
+                #   ;          \;             \\;                \;                  ;
+                #   "          \"             \\\"              \"                 "
+                #   \ (none)   \-escaped was  N/A                 \                  \
+                # So the final bash -c script arg equals the original static
+                # const char kScript[] in exec_wrapper.c  — exact match.
+            else:
+                esc = _cmake_quote_for_set(tok)
+            quoted_items.append(esc)
         new_inner = ";".join(quoted_items)
         new_line = f'{prefix}"{new_inner}"{suffix[1:]}'
         count[0] += 1
@@ -1091,8 +1225,8 @@ def main() -> int:
             rel = p.relative_to(build_dir).as_posix()
             extra = f" [S0={s0_count}]" if s0_count else ""
             print(f"   patched: {rel}{extra}")
-    print(f"\nV24 DONE patch_impl_cmakes.py: scanned {count_seen} cmake files, "
-          f"patched {count_patched} (Strategy0 build/exec->bash@abs/exec.sh fixes={count_s0_fixes}), "
+    print(f"\nV25 DONE patch_impl_cmakes.py: scanned {count_seen} cmake files, "
+          f"patched {count_patched} (Strategy0 build/exec -> bash -c kScript@abs fixes={count_s0_fixes}), "
           f"bash resolved to: {BASH_EXE_ABS!r}; skipped {count_skipped}.")
     return 0
 
