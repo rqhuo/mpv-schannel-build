@@ -29,6 +29,14 @@ What it does (all changes are plain text replacements, verified one by one):
       - DEPENDS: drop `openssl`
       - ENABLE_OPENSSL=OFF (zip/LZMA crypto falls back to Windows Crypto API)
 
+  packages/mpv.cmake  AND  packages/mpv-release.cmake
+      - DEPENDS: drop `subrandr`
+        subrandr's upstream build script hard-panics on i686-pc-windows-gnu
+        ("Building for i686-pc-windows-gnu is currently known to be broken!",
+        issue afishhh/subrandr#31). It is an X11 RandR substitute and is NOT
+        used by mpv on native Windows at all, so we simply disable it for
+        this 32-bit build (mpv meson option `-Dsubrandr=disabled`).
+
 After patching, nothing in the mpv / mpv-release build DAG references the
 openssl ExternalProject anymore, so libmpv-2.dll and mpv.exe link NO OpenSSL
 code at all. TLS (https in mpv streams and libcurl) goes through Schannel,
@@ -135,6 +143,26 @@ REPLACEMENTS = [
      "        -DENABLE_OPENSSL=ON\n",
      "        -DENABLE_OPENSSL=OFF\n",
      1),
+    # ---------------- mpv (git master) & mpv-release: drop subrandr ----------------
+    # subrandr refuses to build for i686-pc-windows-gnu (upstream hard panic,
+    # issue afishhh/subrandr#31). It is X11-only and unused on native Windows,
+    # so disable it for this 32-bit build.
+    ("packages/mpv-release.cmake",
+     "        subrandr\n",
+     "",
+     1),
+    ("packages/mpv-release.cmake",
+     "        -Dsubrandr=enabled\n",
+     "        -Dsubrandr=disabled\n",
+     1),
+    ("packages/mpv.cmake",
+     "        subrandr\n",
+     "",
+     1),
+    ("packages/mpv.cmake",
+     "        -Dsubrandr=enabled\n",
+     "        -Dsubrandr=disabled\n",
+     1),
 ]
 
 # Files where, after patching, no reference to the dropped packages / openssl
@@ -153,6 +181,9 @@ FORBIDDEN_DEPEND_LINES = [
     # nothing else in the mpv DAG may gain an openssl dep
     ("packages/mpv.cmake", "openssl"),
     ("packages/mpv-release.cmake", "openssl"),
+    # subrandr must be gone from the mpv build (X11-only, broken on i686)
+    ("packages/mpv.cmake", "subrandr"),
+    ("packages/mpv-release.cmake", "subrandr"),
 ]
 
 
