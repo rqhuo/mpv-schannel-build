@@ -34,8 +34,13 @@ What it does (all changes are plain text replacements, verified one by one):
         subrandr's upstream build script hard-panics on i686-pc-windows-gnu
         ("Building for i686-pc-windows-gnu is currently known to be broken!",
         issue afishhh/subrandr#31). It is an X11 RandR substitute and is NOT
-        used by mpv on native Windows at all, so we simply disable it for
-        this 32-bit build (mpv meson option `-Dsubrandr=disabled`).
+        used by mpv on native Windows at all, so we drop it for this 32-bit
+        build. NOTE: the stable mpv release we build (v0.41.0) has NO
+        `subrandr` meson option at all, so we must REMOVE the
+        `-Dsubrandr=enabled` line entirely (changing it to `=disabled`
+        would itself be rejected as an "Unknown option"). With subrandr
+        removed from DEPENDS, pkg-config won't find it and mpv simply
+        builds without it.
 
 After patching, nothing in the mpv / mpv-release build DAG references the
 openssl ExternalProject anymore, so libmpv-2.dll and mpv.exe link NO OpenSSL
@@ -145,15 +150,18 @@ REPLACEMENTS = [
      1),
     # ---------------- mpv (git master) & mpv-release: drop subrandr ----------------
     # subrandr refuses to build for i686-pc-windows-gnu (upstream hard panic,
-    # issue afishhh/subrandr#31). It is X11-only and unused on native Windows,
-    # so disable it for this 32-bit build.
+    # issue afishhh/subrandr#31). It is X11-only and unused on native Windows.
+    # The stable mpv release (v0.41.0) has no `subrandr` meson option, so we
+    # must REMOVE the `-Dsubrandr=enabled` line entirely (not set it to
+    # "disabled", which would be rejected as an unknown option). With subrandr
+    # gone from DEPENDS, mpv auto-builds without it.
     ("packages/mpv-release.cmake",
      "        subrandr\n",
      "",
      1),
     ("packages/mpv-release.cmake",
      "        -Dsubrandr=enabled\n",
-     "        -Dsubrandr=disabled\n",
+     "",
      1),
     ("packages/mpv.cmake",
      "        subrandr\n",
@@ -161,7 +169,7 @@ REPLACEMENTS = [
      1),
     ("packages/mpv.cmake",
      "        -Dsubrandr=enabled\n",
-     "        -Dsubrandr=disabled\n",
+     "",
      1),
 ]
 
