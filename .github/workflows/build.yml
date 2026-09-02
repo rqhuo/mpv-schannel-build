@@ -135,18 +135,16 @@ jobs:
           # ---- 预 clone code.videolan.org 的包到 single_source/ ----
           #      x264 和 libbluray 的 GIT_REPOSITORY 指向 code.videolan.org，
           #      该服务器对 GitHub Actions IP 不稳定（gitclone.cmake 失败）。
-          #      用 GitHub 镜像预 clone 到 single_source/<pkg>/，
+          #      直接从 code.videolan.org 预 clone 到 single_source/<pkg>/，
           #      CMake 的 SINGLE_SOURCE_LOCATION 机制看到非空目录就会跳过 download 步骤。
-          git clone --depth 1 \
-            https://github.com/mirror/x264.git "$SB/single_source/x264" || \
-            git clone --depth 1 \
+          #      GIT_TERMINAL_PROMPT=0 防止 git 挂起等待用户名输入。
+          export GIT_TERMINAL_PROMPT=0
+          git clone --depth 1 --filter=tree:0 \
             https://code.videolan.org/videolan/x264.git "$SB/single_source/x264" || \
-            echo "WARN: x264 clone failed both mirrors; will rely on whitelist touch"
-          git clone --depth 1 \
-            https://github.com/libbluray/libbluray.git "$SB/single_source/libbluray" || \
-            git clone --depth 1 \
+            echo "WARN: x264 clone failed; will rely on whitelist touch"
+          git clone --depth 1 --filter=tree:0 \
             https://code.videolan.org/videolan/libbluray.git "$SB/single_source/libbluray" || \
-            echo "WARN: libbluray clone failed both mirrors; will rely on whitelist touch"
+            echo "WARN: libbluray clone failed; will rely on whitelist touch"
 
           echo "---- single_source tree layout ----"
           ls -la "$SB/single_source/"
