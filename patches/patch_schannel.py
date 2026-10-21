@@ -11,7 +11,14 @@ What it does (all changes are plain text replacements, verified one by one):
          drops ffmpeg's ssh/srt protocols and the ARIB caption decoder -
          none of which matter for DVD/Blu-ray/https playback)
       - CONFIGURE_COMMAND: `--enable-openssl` -> `--enable-schannel`
-        and remove `--enable-libssh`, `--enable-libsrt`, `--enable-libaribcaption`
+        and remove `--enable-libssh`, `--enable-libsrt`, `--enable-libaribcaption`,
+        and `--enable-opengl`.
+        * `--enable-opengl`: ffmpeg dropped the OpenGL output device / hwcontext
+          option in newer releases, so the auto-fetched latest FFmpeg rejects it
+          ("Unknown option --enable-opengl"). mpv does its own GL rendering via
+          libplacebo/EGL and never uses ffmpeg's opengl device, so dropping it is
+          harmless. This is the classic superbuild-options-vs-latest-FFmpeg drift;
+          re-run the build after a new FFmpeg release if another option is removed.
         ffmpeg's tls-schannel backend needs only mingw-w64 headers +
         -lsecur32/-lcrypt32, both linked automatically by ffmpeg configure.
 
@@ -92,6 +99,12 @@ REPLACEMENTS = [
      1),
     ("packages/ffmpeg.cmake",
      "        --enable-libaribcaption\n",
+     "",
+     1),
+    # --enable-opengl: removed by newer FFmpeg (unknown option). mpv renders GL
+    # itself via libplacebo/EGL, so ffmpeg's opengl device is unused.
+    ("packages/ffmpeg.cmake",
+     "        --enable-opengl\n",
      "",
      1),
     # ---------------- curl ----------------
