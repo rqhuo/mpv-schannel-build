@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
 patch_schannel.py - Remove OpenSSL from shinchiro/mpv-winbuild-cmake and use
-Windows Schannel TLS instead.
+Windows Schannel TLS instead, AND make the build resilient to FFmpeg "option
+drift".
 
-What it does (all changes are plain text replacements, verified one by one):
+OpenSSL -> Schannel changes (plain text replacements, verified one by one):
 
   packages/ffmpeg.cmake
       - DEPENDS: drop `openssl`, `libssh`, `libsrt`, `libaribcaption`
@@ -11,14 +12,7 @@ What it does (all changes are plain text replacements, verified one by one):
          drops ffmpeg's ssh/srt protocols and the ARIB caption decoder -
          none of which matter for DVD/Blu-ray/https playback)
       - CONFIGURE_COMMAND: `--enable-openssl` -> `--enable-schannel`
-        and remove `--enable-libssh`, `--enable-libsrt`, `--enable-libaribcaption`,
-        and `--enable-opengl`.
-        * `--enable-opengl`: ffmpeg dropped the OpenGL output device / hwcontext
-          option in newer releases, so the auto-fetched latest FFmpeg rejects it
-          ("Unknown option --enable-opengl"). mpv does its own GL rendering via
-          libplacebo/EGL and never uses ffmpeg's opengl device, so dropping it is
-          harmless. This is the classic superbuild-options-vs-latest-FFmpeg drift;
-          re-run the build after a new FFmpeg release if another option is removed.
+        and remove `--enable-libssh`, `--enable-libsrt`, `--enable-libaribcaption`
         ffmpeg's tls-schannel backend needs only mingw-w64 headers +
         -lsecur32/-lcrypt32, both linked automatically by ffmpeg configure.
 
@@ -50,6 +44,28 @@ What it does (all changes are plain text replacements, verified one by one):
           VapourSynth is an advanced scripting-filter feature, not needed for
           DVD / video playback, so we disable it for this 32-bit build.
 
+---------------------------------------------------------------------------
+OPTION-DRIFT AUTO-TOLERANCE (the key robustness feature)
+---------------------------------------------------------------------------
+The superbuild is pinned to an OLDER commit (to keep a working ANGLE / mpv
+build), but FFmpeg is auto-fetched as the LATEST release at build time. When a
+newer FFmpeg removes an option the pinned superbuild still hardcodes (e.g.
+`--enable-opengl`, dropped by FFmpeg in 2025), ffmpeg's configure used to die
+with "Unknown option" and break the whole build.
+
+We inject a `PATCH_COMMAND` into ffmpeg's ExternalProject that runs
+`fix_ffmpeg_configure.sh` on the freshly downloaded FFmpeg source. That script
+rewrites FFmpeg's `die_unknown()` so that UNKNOWN `--enable-X` / `--disable-X`
+options are warned about and SKIPPED (return 0) instead of being fatal, while
+EVERY OTHER unknown option still fails the build (so genuine mistakes still
+surface).
+
+Net effect: future FFmpeg releases that drop a hardcoded option can no longer
+break the build. No more per-option patch maintenance - the drift is absorbed
+automatically. The helper scripts are written into the superbuild root by this
+patch and referenced via ${CMAKE_SOURCE_DIR} (always the top-level source dir,
+independent of add_subdirectory nesting).
+
 After patching, nothing in the mpv / mpv-release build DAG references the
 openssl ExternalProject anymore, so libmpv-2.dll and mpv.exe link NO OpenSSL
 code at all. TLS (https in mpv streams and libcurl) goes through Schannel,
@@ -65,6 +81,45 @@ build.
 import sys
 import pathlib
 import difflib
+
+# ---------------------------------------------------------------------------
+# Option-drift tolerance helper scripts. Written into the superbuild root at
+# patch time, then run by ffmpeg's ExternalProject PATCH_COMMAND on the
+# freshly downloaded FFmpeg source.
+# ---------------------------------------------------------------------------
+FIX_FFMPEG_SH = r'''#!/bin/bash
+# Option-drift safety net for FFmpeg's configure.
+# Rewrites die_unknown() so that unknown --enable-X / --disable-X options are
+# warned about and SKIPPED (return 0) instead of being fatal. Any other unknown
+# option still fails the build. See fix_ffmpeg_configure.awk for the transform.
+set -u
+conf="$1/configure"
+[ -f "$conf" ] || { echo "fix_ffmpeg_configure: $conf not found, skipping"; exit 0; }
+grep -q 'AUTO_TOLERANCE_PATCH' "$conf" && { echo "fix_ffmpeg_configure: already patched, skipping"; exit 0; }
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+awk -f "$SCRIPT_DIR/fix_ffmpeg_configure.awk" "$conf" > "$conf.tmp" && mv "$conf.tmp" "$conf"
+echo "fix_ffmpeg_configure: patched $conf for option-drift tolerance"
+'''
+
+# awk transform: replace the `die_unknown(){ ... }` function with a tolerant
+# version. `dq` is a literal double-quote and `dl` a literal dollar sign, built
+# via sprintf so we never fight shell/awk quoting and avoid escape warnings.
+FIX_FFMPEG_AWK = r'''BEGIN { dq=sprintf("%c",34); dl=sprintf("%c",36) }
+/^die_unknown\(\)\{$/ {
+    print "die_unknown(){"
+    print "    case " dq dl "1" dq " in"
+    print "        --enable-*|--disable-*) echo " dq "WARNING: ignoring unknown enable/disable option (auto-tolerance)." dq "; return 0;;"
+    print "    esac"
+    print "    echo " dq "Unknown option (auto-tolerance: fatal path)." dq
+    print "    exit 1"
+    print "}"
+    print "# AUTO_TOLERANCE_PATCH"
+    skip=1
+    next
+}
+skip==1 && /^}$/ { skip=0; next }
+{ if (skip==0) print }
+'''
 
 # (file, old, new, expected_count)
 REPLACEMENTS = [
@@ -101,11 +156,14 @@ REPLACEMENTS = [
      "        --enable-libaribcaption\n",
      "",
      1),
-    # --enable-opengl: removed by newer FFmpeg (unknown option). mpv renders GL
-    # itself via libplacebo/EGL, so ffmpeg's opengl device is unused.
+    # Inject option-drift tolerance: run fix_ffmpeg_configure.sh as ffmpeg's
+    # PATCH_COMMAND (executed by ExternalProject right after download, before
+    # configure). ${CMAKE_SOURCE_DIR} is the superbuild root where this patch
+    # wrote fix_ffmpeg_configure.sh / .awk.
     ("packages/ffmpeg.cmake",
-     "        --enable-opengl\n",
-     "",
+     "    UPDATE_COMMAND \"\"\n",
+     "    UPDATE_COMMAND \"\"\n"
+     "    PATCH_COMMAND bash ${CMAKE_SOURCE_DIR}/fix_ffmpeg_configure.sh ${SOURCE_DIR}\n",
      1),
     # ---------------- curl ----------------
     ("packages/curl.cmake",
@@ -275,6 +333,12 @@ def main() -> int:
             fromfile=f"a/{rel}", tofile=f"b/{rel}")
         diffs.append("".join(diff))
         (root / rel).write_text(new_text, encoding="utf-8")
+
+    # Write the option-drift tolerance helper scripts into the superbuild root.
+    (root / "fix_ffmpeg_configure.sh").write_text(FIX_FFMPEG_SH, encoding="utf-8")
+    (root / "fix_ffmpeg_configure.awk").write_text(FIX_FFMPEG_AWK, encoding="utf-8")
+    print("OK   wrote fix_ffmpeg_configure.sh / fix_ffmpeg_configure.awk "
+          "(option-drift tolerance)")
 
     # Post-checks: no leftover dependency lines / openssl linkage in patched
     # files or in the mpv package definitions.
