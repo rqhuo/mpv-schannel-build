@@ -93,7 +93,7 @@ FIX_FFMPEG_SH = r'''#!/bin/bash
 # warned about and SKIPPED (return 0) instead of being fatal. Any other unknown
 # option still fails the build. See fix_ffmpeg_configure.awk for the transform.
 set -u
-conf="$1/configure"
+conf="${1:-.}/configure"
 [ -f "$conf" ] || { echo "fix_ffmpeg_configure: $conf not found, skipping"; exit 0; }
 grep -q 'AUTO_TOLERANCE_PATCH' "$conf" && { echo "fix_ffmpeg_configure: already patched, skipping"; exit 0; }
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -163,7 +163,7 @@ REPLACEMENTS = [
     ("packages/ffmpeg.cmake",
      "    UPDATE_COMMAND \"\"\n",
      "    UPDATE_COMMAND \"\"\n"
-     "    PATCH_COMMAND bash ${CMAKE_SOURCE_DIR}/fix_ffmpeg_configure.sh ${SOURCE_DIR}\n",
+     "    PATCH_COMMAND bash ${CMAKE_SOURCE_DIR}/fix_ffmpeg_configure.sh <SOURCE_DIR>\n",
      1),
     # ---------------- curl ----------------
     ("packages/curl.cmake",
