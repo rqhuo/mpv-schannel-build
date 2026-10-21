@@ -98,6 +98,9 @@ conf="${1:-.}/configure"
 grep -q 'AUTO_TOLERANCE_PATCH' "$conf" && { echo "fix_ffmpeg_configure: already patched, skipping"; exit 0; }
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 awk -f "$SCRIPT_DIR/fix_ffmpeg_configure.awk" "$conf" > "$conf.tmp" && mv "$conf.tmp" "$conf"
+# The redirected tmp file loses the original executable bit; ffmpeg's configure
+# is run directly (./configure) by ExternalProject, so restore +x explicitly.
+chmod +x "$conf"
 echo "fix_ffmpeg_configure: patched $conf for option-drift tolerance"
 '''
 
