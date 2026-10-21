@@ -70,6 +70,14 @@ jobs:
       image: ghcr.io/shinchiro/archlinux:latest
     env:
       MPV_TARGET: ${{ inputs.mpv_target || 'mpv-release' }}
+      # Pin the superbuild (build harness) to a known-good commit.
+      # Upstream churned on 2026-10 and a "Revert 'angle-headers: reset to
+      # working commit'" dropped EGL_PLATFORM_ANGLE_TYPE_D3D9_ANGLE that mpv
+      # 0.41.0 (latest stable) still uses, breaking the mpv build. Pinning the
+      # harness keeps the build reproducible; mpv / ffmpeg versions are STILL
+      # auto-fetched as "latest stable" by the superbuild at build time
+      # (packages/mpv-release.cmake queries /releases/latest).
+      SUPERBUILD_COMMIT: 05a60b3cfd
     defaults:
       run:
         shell: bash
@@ -88,21 +96,31 @@ jobs:
       # ccache, package stamps and downloaded sources (src_packages).
       # Fresh run: ~2-3 h. Cached run: toolchain skipped, only changed
       # packages rebuild.
+      - name: Resolve cache key
+        run: |
+          # Cache is isolated per superbuild commit AND per patch revision, so a
+          # harness/patch change triggers a clean rebuild instead of mixing a
+          # stale dependency tree with a new configuration (which previously
+          # broke the mpv build).
+          PH="$(sha256sum patches/patch_schannel.py | cut -c1-12)"
+          echo "PATCH_HASH=${PH}" >> "$GITHUB_ENV"
+          echo "cache base: i686-schannel-build-${SUPERBUILD_COMMIT}-${PH}"
+
       - name: Restore build cache
         uses: actions/cache/restore@v4
         with:
           path: mpv-winbuild
-          key: i686-schannel-build-${{ github.run_id }}
+          key: i686-schannel-build-${{ env.SUPERBUILD_COMMIT }}-${{ env.PATCH_HASH }}
           restore-keys: |
-            i686-schannel-build-
+            i686-schannel-build-${{ env.SUPERBUILD_COMMIT }}-
 
-      - name: Clone / update shinchiro superbuild
+      - name: Clone / pin shinchiro superbuild
         run: |
           if [ ! -d mpv-winbuild/.git ]; then
             git clone https://github.com/shinchiro/mpv-winbuild-cmake.git mpv-winbuild
           fi
-          git -C mpv-winbuild fetch origin master
-          git -C mpv-winbuild checkout -f FETCH_HEAD
+          git -C mpv-winbuild fetch origin
+          git -C mpv-winbuild checkout -f "$SUPERBUILD_COMMIT"
           echo "SUPERBUILD_HEAD=$(git -C mpv-winbuild rev-parse --short HEAD)"
 
       - name: Patch superbuild (openssl -> schannel)
@@ -252,8 +270,8 @@ jobs:
           retention-days: 7
 
       - name: Save build cache
-        if: always()
+        if: success()
         uses: actions/cache/save@v4
         with:
           path: mpv-winbuild
-          key: i686-schannel-build-${{ github.run_id }}
+          key: i686-schannel-build-${{ env.SUPERBUILD_COMMIT }}-${{ env.PATCH_HASH }}
