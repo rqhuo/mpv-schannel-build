@@ -168,6 +168,23 @@ REPLACEMENTS = [
      "    UPDATE_COMMAND \"\"\n"
      "    PATCH_COMMAND bash ${CMAKE_SOURCE_DIR}/fix_ffmpeg_configure.sh <SOURCE_DIR>\n",
      1),
+    # ---------------- fontconfig: pin to a commit the superbuild's patches apply to ----------------
+    # fontconfig is fetched with GIT_TAG main (moving target). shinchiro's two
+    # patches (0001 Custom changes for mpv builds, 0002 Do not use dirent.h) are
+    # ESSENTIAL for the Windows/i686 build (the _WIN32 SHGetFolderPathA font-dir
+    # code and the dirent.h meson-drop). When fontconfig main drifted
+    # (commit 8d33d57a131e "Drop non-XDG fonts..." on 2026-10-28, then the
+    # 2026-10-30 portal-indexer work), `git am --3way` could no longer build a
+    # 3-way base (the superbuild clones with --filter=tree:0, so historical blobs
+    # are absent) and the build died with "could not build fake ancestor".
+    # Pinning to the last main commit BEFORE that drift (verified locally with
+    # `git apply --check` on both patches) keeps fontconfig stable and lets the
+    # patches apply straight. mpv/ffmpeg still auto-track latest; fontconfig is a
+    # low-churn dependency where pinning for reproducibility is the right call.
+    ("packages/fontconfig.cmake",
+     "    GIT_TAG main\n",
+     "    GIT_TAG b25ffeabd15b\n",
+     1),
     # ---------------- curl ----------------
     ("packages/curl.cmake",
      "        openssl\n",
