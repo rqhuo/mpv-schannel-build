@@ -71,6 +71,19 @@ openssl ExternalProject anymore, so libmpv-2.dll and mpv.exe link NO OpenSSL
 code at all. TLS (https in mpv streams and libcurl) goes through Schannel,
 i.e. Windows' own SChannel SSPI with the system certificate store.
 
+WHY TLS 1.2/1.3 ONLY (fixes the Windows "insecure TLS" Program Compatibility
+Assistant popup on live streams): FFmpeg's tls_schannel.c leaves
+SCHANNEL_CRED.grbitEnabledProtocols at 0 (system default). On many Windows
+clients that default STILL advertises TLS 1.0/1.1 in the ClientHello. Windows'
+Program Compatibility Assistant hooks Schannel and pops "this program is trying
+to use an insecure TLS version" whenever such a handshake is attempted -- which
+is exactly why it only appears after a few stalls/reconnects (each fresh socket
+re-opens a TLS session). We inject an awk transform (fix_tls_schannel.awk) via
+the same ffmpeg PATCH_COMMAND that pins grbitEnabledProtocols to
+SP_PROT_TLS1_2_CLIENT | SP_PROT_TLS1_3_CLIENT, removing the legacy offer
+entirely. This is harmless: modern live-stream servers all speak TLS 1.2+, and
+it does not affect DTLS (overridden by the existing DTLS block).
+
 Usage:
     python3 patch_schannel.py <superbuild-root>   # e.g. mpv-winbuild/
 
@@ -88,20 +101,47 @@ import difflib
 # freshly downloaded FFmpeg source.
 # ---------------------------------------------------------------------------
 FIX_FFMPEG_SH = r'''#!/bin/bash
-# Option-drift safety net for FFmpeg's configure.
-# Rewrites die_unknown() so that unknown --enable-X / --disable-X options are
-# warned about and SKIPPED (return 0) instead of being fatal. Any other unknown
-# option still fails the build. See fix_ffmpeg_configure.awk for the transform.
+# (1) Option-drift safety net for FFmpeg's configure: rewrites die_unknown() so
+#     unknown --enable-X / --disable-X options are warned and SKIPPED instead of
+#     fatal. (2) Restricts Schannel's TLS to 1.2/1.3 so Windows' Program
+#     Compatibility Assistant does not pop "insecure TLS" on live-stream
+#     reconnects. See the two .awk helpers for the exact transforms.
 set -u
-conf="${1:-.}/configure"
-[ -f "$conf" ] || { echo "fix_ffmpeg_configure: $conf not found, skipping"; exit 0; }
-grep -q 'AUTO_TOLERANCE_PATCH' "$conf" && { echo "fix_ffmpeg_configure: already patched, skipping"; exit 0; }
+SRCDIR="${1:-.}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-awk -f "$SCRIPT_DIR/fix_ffmpeg_configure.awk" "$conf" > "$conf.tmp" && mv "$conf.tmp" "$conf"
-# The redirected tmp file loses the original executable bit; ffmpeg's configure
-# is run directly (./configure) by ExternalProject, so restore +x explicitly.
-chmod +x "$conf"
-echo "fix_ffmpeg_configure: patched $conf for option-drift tolerance"
+
+# --- (1) configure option-drift tolerance ---
+conf="$SRCDIR/configure"
+if [ -f "$conf" ]; then
+  if grep -q 'AUTO_TOLERANCE_PATCH' "$conf"; then
+    echo "fix_ffmpeg_configure: configure already patched, skipping"
+  else
+    awk -f "$SCRIPT_DIR/fix_ffmpeg_configure.awk" "$conf" > "$conf.tmp" && mv "$conf.tmp" "$conf"
+    # The redirected tmp file loses the original executable bit; ffmpeg's
+    # configure is run directly (./configure) by ExternalProject, so restore +x.
+    chmod +x "$conf"
+    echo "fix_ffmpeg_configure: patched $conf for option-drift tolerance"
+  fi
+else
+  echo "fix_ffmpeg_configure: $conf not found, skipping"
+fi
+
+# --- (2) Schannel TLS 1.2/1.3 restriction (avoids Windows PCA "insecure TLS") ---
+tls_c="$SRCDIR/libavformat/tls_schannel.c"
+if [ -f "$tls_c" ]; then
+  if grep -q 'SCHANNEL_TLS12_ONLY' "$tls_c"; then
+    echo "fix_ffmpeg_configure: tls_schannel.c already restricted, skipping"
+  else
+    awk -f "$SCRIPT_DIR/fix_tls_schannel.awk" "$tls_c" > "$tls_c.tmp" && mv "$tls_c.tmp" "$tls_c"
+    if grep -q 'SCHANNEL_TLS12_ONLY' "$tls_c"; then
+      echo "fix_ffmpeg_configure: restricted tls_schannel.c to TLS 1.2/1.3"
+    else
+      echo "fix_ffmpeg_configure: WARNING tls_schannel.c restriction did NOT apply (source may have drifted)"
+    fi
+  fi
+else
+  echo "fix_ffmpeg_configure: $tls_c not found, skipping"
+fi
 '''
 
 # awk transform: replace the `die_unknown(){ ... }` function with a tolerant
@@ -122,6 +162,31 @@ FIX_FFMPEG_AWK = r'''BEGIN { dq=sprintf("%c",34); dl=sprintf("%c",36) }
 }
 skip==1 && /^}$/ { skip=0; next }
 { if (skip==0) print }
+'''
+
+# awk transform: in FFmpeg's libavformat/tls_schannel.c, the client branch of
+# tls_open() only sets `schannel_cred.dwFlags |= SCH_CRED_NO_DEFAULT_CREDS;` and
+# leaves grbitEnabledProtocols at 0 (system default). On many Windows clients that
+# default still advertises TLS 1.0/1.1, and the Windows Program Compatibility
+# Assistant pops "this program is trying to use an insecure TLS version" on any
+# such handshake (notably after a live-stream stall/reconnect opens a fresh
+# socket). We insert an explicit restriction to TLS 1.2/1.3 right after that
+# dwFlags line. The later DTLS block overrides grbitEnabledProtocols for DTLS, so
+# only ordinary TLS client connections are affected. The #ifdef guards against
+# toolchains whose schannel.h lacks SP_PROT_TLS1_3_CLIENT.
+FIX_TLS_SCHANNEL_AWK = r'''# Restrict Schannel to TLS 1.2/1.3 in FFmpeg's tls_schannel.c.
+# See the header comment in patch_schannel.py (FIX_TLS_SCHANNEL_AWK) for why.
+/schannel_cred\.dwFlags.*SCH_CRED_NO_DEFAULT_CREDS/ {
+    print
+    print "        /* SCHANNEL_TLS12_ONLY: restrict to TLS 1.2/1.3 (see fix_tls_schannel.awk). */"
+    print "        schannel_cred.grbitEnabledProtocols = SP_PROT_TLS1_2_CLIENT"
+    print "#ifdef SP_PROT_TLS1_3_CLIENT"
+    print "            | SP_PROT_TLS1_3_CLIENT"
+    print "#endif"
+    print "            ;"
+    next
+}
+{ print }
 '''
 
 # (file, old, new, expected_count)
@@ -373,11 +438,14 @@ def main() -> int:
         diffs.append("".join(diff))
         (root / rel).write_text(new_text, encoding="utf-8")
 
-    # Write the option-drift tolerance helper scripts into the superbuild root.
+    # Write the option-drift tolerance + Schannel TLS 1.2/1.3 helper scripts
+    # into the superbuild root (referenced by ffmpeg's PATCH_COMMAND via
+    # ${CMAKE_SOURCE_DIR}).
     (root / "fix_ffmpeg_configure.sh").write_text(FIX_FFMPEG_SH, encoding="utf-8")
     (root / "fix_ffmpeg_configure.awk").write_text(FIX_FFMPEG_AWK, encoding="utf-8")
+    (root / "fix_tls_schannel.awk").write_text(FIX_TLS_SCHANNEL_AWK, encoding="utf-8")
     print("OK   wrote fix_ffmpeg_configure.sh / fix_ffmpeg_configure.awk "
-          "(option-drift tolerance)")
+          "(option-drift tolerance) and fix_tls_schannel.awk (TLS 1.2/1.3)")
 
     # Post-checks: no leftover dependency lines / openssl linkage in patched
     # files or in the mpv package definitions.
