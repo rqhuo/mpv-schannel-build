@@ -185,6 +185,25 @@ REPLACEMENTS = [
      "    GIT_TAG main\n",
      "    GIT_TAG b25ffeabd15b\n",
      1),
+    # ---------------- superbuild git machinery: allow pinned commit hashes ----------------
+    # shinchiro's add_project helper (cmake/custom_steps.cmake) writes a
+    # `reset_head.sh` that unconditionally runs `git -C <src> rev-parse @{u}`
+    # (the upstream branch). When a package is pinned to a bare COMMIT HASH
+    # (as we do for fontconfig above), the checkout is a DETACHED HEAD with no
+    # upstream, so `git rev-parse @{u}` dies with
+    #   "fatal: HEAD does not point to a branch"
+    # and the whole fontconfig force-update / postremovebuild step fails.
+    # force_rebuild_git() also deliberately clears `reset` to "" for hashes,
+    # so pinning to a hash is otherwise unsupported by this superbuild.
+    # Fix: make the @{u} lookup tolerant -> on a detached HEAD it now yields an
+    # empty string (stderr swallowed, `|| true` keeps `set -e` happy). The
+    # surrounding `if` then takes the `then` branch and runs
+    # `git reset --hard ${reset}` with reset=="" (a no-op on detached HEAD), so
+    # we stay pinned at the hash instead of erroring out.
+    ("cmake/custom_steps.cmake",
+     "git -C ${source_dir} rev-parse @{u}",
+     "git -C ${source_dir} rev-parse @{u} 2>/dev/null || true",
+     1),
     # ---------------- curl ----------------
     ("packages/curl.cmake",
      "        openssl\n",
