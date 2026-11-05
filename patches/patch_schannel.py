@@ -279,6 +279,20 @@ REPLACEMENTS = [
      "    git -C ${source_dir} reset --hard ${reset} -q\n",
      "    git -C ${source_dir} reset --hard ${reset} -q 2>/dev/null || git -C ${source_dir} reset --hard -q\n",
      1),
+    # ---------------- libvpl: let git am --3way fetch the 3-way base ----------------
+    # libvpl tracks GIT_TAG main (a moving branch) and is patched with
+    # `git am --3way`. When upstream drifts, the patch no longer applies
+    # directly and git falls back to a 3-way merge, which needs the BASE blob
+    # of the file. The superbuild clones with --filter=tree:0 (no historical
+    # blobs/trees), so the base is absent and `git am --3way` dies with
+    #   "sha1 information is lacking or useless" / "could not build fake ancestor"
+    # We do a FULL clone for libvpl (drop the filter) so the base blob is
+    # present and the drifted patch applies via 3-way. libvpl's history is
+    # modest, so a full clone is affordable (and cached afterwards).
+    ("packages/libvpl.cmake",
+     "    GIT_CLONE_FLAGS \"--filter=tree:0\"\n",
+     "    GIT_CLONE_FLAGS \"\"\n",
+     1),
     # ---------------- curl ----------------
     ("packages/curl.cmake",
      "        openssl\n",
@@ -447,6 +461,28 @@ def main() -> int:
             fromfile=f"a/{rel}", tofile=f"b/{rel}")
         diffs.append("".join(diff))
         (root / rel).write_text(new_text, encoding="utf-8")
+
+    # ------------------------------------------------------------------
+    # Global fix: --filter=tree:0 (partial clone) breaks `git am --3way` for
+    # ANY git package whose upstream has drifted since this superbuild commit
+    # (05a60b3cfd) was pinned. With tree:0 the 3-way merge BASE tree/blob is
+    # absent, so drifted patches fail with "could not build fake ancestor".
+    # Switching to --filter=blob:none keeps clones lean (blobs still fetched
+    # on demand) while trees ARE present, so git am --3way can locate the base
+    # and reconstruct the ancestor. This is a safety net for every git package
+    # that tracks a moving branch; libvpl above is switched to a full clone for
+    # an extra guarantee on the currently-failing package.
+    GLOBAL_FILTER_OLD = 'GIT_CLONE_FLAGS "--filter=tree:0"'
+    GLOBAL_FILTER_NEW = 'GIT_CLONE_FLAGS "--filter=blob:none"'
+    for cmake_file in sorted(root.rglob("*.cmake")):
+        try:
+            t = cmake_file.read_text(encoding="utf-8")
+        except (IsADirectoryError, UnicodeDecodeError, PermissionError):
+            continue
+        if GLOBAL_FILTER_OLD in t:
+            cmake_file.write_text(
+                t.replace(GLOBAL_FILTER_OLD, GLOBAL_FILTER_NEW), encoding="utf-8")
+            print(f"OK   [global] {cmake_file}: --filter=tree:0 -> blob:none")
 
     # Write the option-drift tolerance + Schannel TLS 1.2/1.3 helper scripts
     # into the superbuild root (referenced by ffmpeg's PATCH_COMMAND via
