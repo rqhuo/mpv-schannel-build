@@ -84,6 +84,16 @@ SP_PROT_TLS1_2_CLIENT | SP_PROT_TLS1_3_CLIENT, removing the legacy offer
 entirely. This is harmless: modern live-stream servers all speak TLS 1.2+, and
 it does not affect DTLS (overridden by the existing DTLS block).
 
+The SAME restriction is applied to curl's Schannel backend (lib/vtls/schannel.c)
+for the same reason: curl's schannel.c computes grbitEnabledProtocols / the
+SCH_CREDENTIALS grbitDisabledProtocols from the requested SSL version range, and
+its DEFAULT range still advertises TLS 1.0/1.1 in the ClientHello. We inject
+fix_curl_schannel.awk via curl's PATCH_COMMAND (after shinchiro's own git-am
+patches) that forces TLS 1.2/1.3 only in BOTH the legacy SCHANNEL_CRED branch
+(`schannel_cred.grbitEnabledProtocols`) and the modern SCH_CREDENTIALS branch
+(`credentials.pTlsParameters->grbitDisabledProtocols`), so every curl https
+handshake from mpv (playlist fetch, lua http, etc.) also avoids the PCA popup.
+
 Usage:
     python3 patch_schannel.py <superbuild-root>   # e.g. mpv-winbuild/
 
@@ -184,6 +194,68 @@ FIX_TLS_SCHANNEL_AWK = r'''# Restrict Schannel to TLS 1.2/1.3 in FFmpeg's tls_sc
     print "            | SP_PROT_TLS1_3_CLIENT"
     print "#endif"
     print "            ;"
+    next
+}
+{ print }
+'''
+
+# bash driver for the curl Schannel TLS 1.2/1.3 restriction. Written into the
+# superbuild root; invoked from curl's PATCH_COMMAND (after shinchiro's own
+# git-am patches) on the freshly downloaded curl source. Same shape as the
+# ffmpeg driver: idempotent, drift-safe (prints WARNING + skips if the anchors
+# are gone, never fails the build).
+FIX_CURL_SH = r'''#!/bin/bash
+# Restrict curl's Schannel to TLS 1.2/1.3 so Windows' Program Compatibility
+# Assistant does not pop "insecure TLS" on any curl https handshake from mpv
+# (playlist fetch, lua http, etc.). See fix_curl_schannel.awk for the transform.
+set -u
+SRCDIR="${1:-.}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+sch="$SRCDIR/lib/vtls/schannel.c"
+if [ -f "$sch" ]; then
+  if grep -q 'CURL_SCHANNEL_TLS12_ONLY' "$sch"; then
+    echo "fix_curl_schannel: already restricted, skipping"
+  else
+    awk -f "$SCRIPT_DIR/fix_curl_schannel.awk" "$sch" > "$sch.tmp" && mv "$sch.tmp" "$sch"
+    if grep -q 'CURL_SCHANNEL_TLS12_ONLY' "$sch"; then
+      echo "fix_curl_schannel: restricted $sch to TLS 1.2/1.3"
+    else
+      echo "fix_curl_schannel: WARNING restriction did NOT apply (curl schannel.c may have drifted)"
+    fi
+  fi
+else
+  echo "fix_curl_schannel: $sch not found, skipping"
+fi
+'''
+
+# awk transform for curl's lib/vtls/schannel.c. Two exit points write the
+# enabled/disabled protocol mask in acquire_sspi_handle():
+#   (a) legacy branch:  schannel_cred.grbitEnabledProtocols = enabled_protocols;
+#       -> keep the assignment, then AND it down to TLS 1.2/1.3 (incremental,
+#          robust even if upstream tweaks the surrounding code).
+#   (b) modern branch (Win11 / Server 2022+, no cipher_list):
+#       credentials.pTlsParameters->grbitDisabledProtocols = ~enabled_protocols;
+#       -> REPLACE with a fixed disabled mask that leaves only TLS 1.2/1.3 on.
+# The #ifdef guards against toolchains whose schannel.h lacks SP_PROT_TLS1_3_CLIENT.
+# If neither anchor matches (curl drifts), the file is left untouched.
+FIX_CURL_SCHANNEL_AWK = r'''# Restrict curl's Schannel to TLS 1.2/1.3. See patch_schannel.py (FIX_CURL_SCHANNEL_AWK).
+/schannel_cred\.grbitEnabledProtocols = enabled_protocols;/ {
+    print
+    print "    /* CURL_SCHANNEL_TLS12_ONLY: restrict to TLS 1.2/1.3 (see fix_curl_schannel.awk). */"
+    print "    schannel_cred.grbitEnabledProtocols &= (SP_PROT_TLS1_2_CLIENT"
+    print "#ifdef SP_PROT_TLS1_3_CLIENT"
+    print "        | SP_PROT_TLS1_3_CLIENT"
+    print "#endif"
+    print "        );"
+    next
+}
+/grbitDisabledProtocols = ~enabled_protocols;/ {
+    print "    /* CURL_SCHANNEL_TLS12_ONLY: disable all but TLS 1.2/1.3 (see fix_curl_schannel.awk). */"
+    print "    credentials.pTlsParameters->grbitDisabledProtocols = ~(SP_PROT_TLS1_2_CLIENT"
+    print "#ifdef SP_PROT_TLS1_3_CLIENT"
+    print "        | SP_PROT_TLS1_3_CLIENT"
+    print "#endif"
+    print "        );"
     next
 }
 { print }
@@ -339,6 +411,15 @@ REPLACEMENTS = [
      "'-DNGHTTP3_STATICLIB -DNGHTTP2_STATICLIB -DNGTCP2_STATICLIB -lz",
      "'-DNGHTTP2_STATICLIB -lz",
      1),
+    # Inject the Schannel TLS 1.2/1.3 restriction into curl's source. curl's
+    # PATCH_COMMAND already runs shinchiro's own `git am --3way`; we chain our
+    # awk driver after it. ${CMAKE_SOURCE_DIR} is the superbuild root where this
+    # patch wrote fix_curl_schannel.sh / .awk, and <SOURCE_DIR> is the freshly
+    # cloned curl source.
+    ("packages/curl.cmake",
+     "    PATCH_COMMAND ${EXEC} git am --3way ${CMAKE_CURRENT_SOURCE_DIR}/curl-*.patch\n",
+     "    PATCH_COMMAND ${EXEC} git am --3way ${CMAKE_CURRENT_SOURCE_DIR}/curl-*.patch && bash ${CMAKE_SOURCE_DIR}/fix_curl_schannel.sh <SOURCE_DIR>\n",
+     1),
     # ---------------- libarchive ----------------
     ("packages/libarchive.cmake",
      "        openssl\n",
@@ -485,13 +566,16 @@ def main() -> int:
             print(f"OK   [global] {cmake_file}: --filter=tree:0 -> blob:none")
 
     # Write the option-drift tolerance + Schannel TLS 1.2/1.3 helper scripts
-    # into the superbuild root (referenced by ffmpeg's PATCH_COMMAND via
-    # ${CMAKE_SOURCE_DIR}).
+    # into the superbuild root (referenced by ffmpeg's / curl's PATCH_COMMAND
+    # via ${CMAKE_SOURCE_DIR}).
     (root / "fix_ffmpeg_configure.sh").write_text(FIX_FFMPEG_SH, encoding="utf-8")
     (root / "fix_ffmpeg_configure.awk").write_text(FIX_FFMPEG_AWK, encoding="utf-8")
     (root / "fix_tls_schannel.awk").write_text(FIX_TLS_SCHANNEL_AWK, encoding="utf-8")
+    (root / "fix_curl_schannel.sh").write_text(FIX_CURL_SH, encoding="utf-8")
+    (root / "fix_curl_schannel.awk").write_text(FIX_CURL_SCHANNEL_AWK, encoding="utf-8")
     print("OK   wrote fix_ffmpeg_configure.sh / fix_ffmpeg_configure.awk "
-          "(option-drift tolerance) and fix_tls_schannel.awk (TLS 1.2/1.3)")
+          "(option-drift tolerance), fix_tls_schannel.awk (ffmpeg TLS 1.2/1.3), "
+          "and fix_curl_schannel.sh / fix_curl_schannel.awk (curl TLS 1.2/1.3)")
 
     # Post-checks: no leftover dependency lines / openssl linkage in patched
     # files or in the mpv package definitions.
