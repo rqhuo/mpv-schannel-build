@@ -251,23 +251,33 @@ REPLACEMENTS = [
      "    GIT_TAG b25ffeabd15b\n",
      1),
     # ---------------- superbuild git machinery: allow pinned commit hashes ----------------
-    # shinchiro's add_project helper (cmake/custom_steps.cmake) writes a
-    # `reset_head.sh` that unconditionally runs `git -C <src> rev-parse @{u}`
-    # (the upstream branch). When a package is pinned to a bare COMMIT HASH
-    # (as we do for fontconfig above), the checkout is a DETACHED HEAD with no
-    # upstream, so `git rev-parse @{u}` dies with
-    #   "fatal: HEAD does not point to a branch"
-    # and the whole fontconfig force-update / postremovebuild step fails.
-    # force_rebuild_git() also deliberately clears `reset` to "" for hashes,
-    # so pinning to a hash is otherwise unsupported by this superbuild.
-    # Fix: make the @{u} lookup tolerant -> on a detached HEAD it now yields an
-    # empty string (stderr swallowed, `|| true` keeps `set -e` happy). The
-    # surrounding `if` then takes the `then` branch and runs
-    # `git reset --hard ${reset}` with reset=="" (a no-op on detached HEAD), so
-    # we stay pinned at the hash instead of erroring out.
+    # shinchiro's helper (cmake/custom_steps.cmake) writes a `reset_head.sh`
+    # that, for a package whose GIT_REMOTE_NAME is set (fontconfig sets
+    # `GIT_REMOTE_NAME origin`) and whose GIT_TAG is a bare COMMIT HASH (what we
+    # pin fontconfig to), computes `reset="@{u}"` and then runs, inside the
+    # then-branch:
+    #       git -C <src> reset --hard @{u} -q
+    # A hash checkout is a DETACHED HEAD with no upstream, so `git reset --hard
+    # @{u}` dies with "fatal: HEAD does not point to a branch" (exit 128) and
+    # `set -e` aborts the whole fontconfig force-update / postremovebuild step
+    # (this is the REAL failure - NOT the rev-parse @{u} in the [[ ]] guard,
+    # which only prints a harmless stderr warning).
+    #
+    # Fix: make the then-branch reset tolerant of a detached HEAD. Try
+    # `git reset --hard @{u}` first; if it fails (no upstream), fall back to
+    # `git reset --hard -q` which simply stays at the already-checked-out pinned
+    # commit. Both behaviours are correct: a real branch tracking @{u} moves to
+    # upstream, a detached HEAD stays pinned.
+    #
+    # We also suppress the harmless stderr "fatal: HEAD does not point to a
+    # branch" from the [[ ]] guard's `git rev-parse @{u}` so the log stays clean.
     ("cmake/custom_steps.cmake",
      "git -C ${source_dir} rev-parse @{u}",
      "git -C ${source_dir} rev-parse @{u} 2>/dev/null || true",
+     1),
+    ("cmake/custom_steps.cmake",
+     "    git -C ${source_dir} reset --hard ${reset} -q\n",
+     "    git -C ${source_dir} reset --hard ${reset} -q 2>/dev/null || git -C ${source_dir} reset --hard -q\n",
      1),
     # ---------------- curl ----------------
     ("packages/curl.cmake",
