@@ -98,11 +98,11 @@ jobs:
       # packages rebuild.
       - name: Resolve cache key
         run: |
-          # Cache is isolated per superbuild commit AND per patch revision, so a
-          # harness/patch change triggers a clean rebuild instead of mixing a
-          # stale dependency tree with a new configuration (which previously
-          # broke the mpv build).
-          PH="$(sha256sum patches/patch_schannel.py | cut -c1-12)"
+          # Cache is isolated per superbuild commit AND per patch/workflow
+          # revision. Hash BOTH files: the cache holds ExternalProject stamps
+          # whose meaning depends on the patch AND on how this workflow
+          # prepares the tree. Changing either must start from clean sources.
+          PH="$(cat patches/patch_schannel.py .github/workflows/build.yml | sha256sum | cut -c1-12)"
           echo "PATCH_HASH=${PH}" >> "$GITHUB_ENV"
           echo "cache base: i686-schannel-build-${SUPERBUILD_COMMIT}-${PH}"
 
@@ -115,24 +115,29 @@ jobs:
           restore-keys: |
             i686-schannel-build-${{ env.SUPERBUILD_COMMIT }}-
 
-      # `restore-keys` above allows a PREFIX match, so when the patch revision
+      # `restore-keys` above allows a PREFIX match, so when the patch/workflow
       # changes actions/cache falls back to a cache produced by a DIFFERENT
-      # patch. That tree contains src_packages git checkouts cloned with the OLD
-      # flags (--filter=tree:0) and stamps from the OLD patch commands. This is
-      # exactly what made `git am --3way` die with "could not build fake
-      # ancestor", and would also silently SKIP a newly added PATCH_COMMAND.
-      # Force the affected packages to be re-cloned / re-patched with the
-      # CURRENT patch, while keeping the expensive cross toolchain and all
-      # unrelated built artifacts from the cache.
-      - name: Invalidate stale git sources on a partial cache hit
+      # revision. That tree is NOT safe to reuse incrementally:
+      #   * shinchiro's postremovebuild / reset_head.sh run `git reset --hard`
+      #     after every package install, which WIPES every PATCH_COMMAND
+      #     injection (ffmpeg's option-drift tolerance + TLS 1.2/1.3, curl's
+      #     TLS 1.2/1.3, git-am patches) while leaving the -patch stamps in
+      #     place. A downstream configure then re-runs against UNPATCHED
+      #     sources and dies ("Unknown option --enable-opengl", or "could not
+      #     build fake ancestor").
+      #   * a partial clone from an older revision lacks the 3-way base blobs.
+      # So on any non-exact hit, drop ALL package sources + stamps for a clean,
+      # fully-patched rebuild. The expensive cross toolchain (build/install),
+      # rustup and ccache are outside these paths and stay cached.
+      - name: Reset package build state on a partial cache hit
         if: steps.cache-restore.outputs.cache-hit != 'true'
         run: |
           set -e
-          for p in fontconfig curl libvpl; do
-            rm -rf "mpv-winbuild/src_packages/$p" \
-                   "mpv-winbuild/build/packages/${p}-prefix"
-          done
-          echo "partial cache hit: invalidated fontconfig/curl/libvpl sources + stamps"
+          rm -rf mpv-winbuild/src_packages \
+                 mpv-winbuild/build/packages \
+                 mpv-winbuild/build/mpv-*i686* \
+                 mpv-winbuild/build/mpv-package
+          echo "partial cache hit: dropped all package sources + stamps (toolchain kept)"
 
       - name: Clone / pin shinchiro superbuild
         run: |
@@ -171,10 +176,13 @@ jobs:
           fi
           ls -la mpv-winbuild/build/install/bin/ | head -20
 
-      - name: Update cached git packages (no-op on fresh run)
-        run: |
-          ninja -C mpv-winbuild/build update || true
-
+      # Deliberately NO `ninja ... update` here. shinchiro's force-update step
+      # runs `git fetch` + `reset_head.sh` (`git reset --hard`) on every git
+      # package. On a cached re-run that silently discards PATCH_COMMAND
+      # injections while leaving their stamps intact, so the following build
+      # uses unpatched sources. Fresh clones from `ninja download` already pick
+      # up each package's GIT_TAG, so updating again is both redundant and
+      # harmful.
       - name: Build mpv (target ${{ env.MPV_TARGET }})
         run: |
           # Force a clean (re)configure of the mpv target. The superbuild
