@@ -309,18 +309,38 @@ REPLACEMENTS = [
     # fontconfig is fetched with GIT_TAG main (moving target). shinchiro's two
     # patches (0001 Custom changes for mpv builds, 0002 Do not use dirent.h) are
     # ESSENTIAL for the Windows/i686 build (the _WIN32 SHGetFolderPathA font-dir
-    # code and the dirent.h meson-drop). When fontconfig main drifted
-    # (commit 8d33d57a131e "Drop non-XDG fonts..." on 2026-10-28, then the
-    # 2026-10-30 portal-indexer work), `git am --3way` could no longer build a
-    # 3-way base (the superbuild clones with --filter=tree:0, so historical blobs
-    # are absent) and the build died with "could not build fake ancestor".
-    # Pinning to the last main commit BEFORE that drift (verified locally with
-    # `git apply --check` on both patches) keeps fontconfig stable and lets the
-    # patches apply straight. mpv/ffmpeg still auto-track latest; fontconfig is a
-    # low-churn dependency where pinning for reproducibility is the right call.
+    # code and the dirent.h meson-drop). When fontconfig main drifts, `git am
+    # --3way` can no longer apply the patches straight and falls back to a 3-way
+    # merge, which needs the BASE blob of every touched file (e.g. the
+    # `src/fcdir.c` blob c17875f referenced by the patch's `index` line).
+    #
+    # Two things make that 3-way merge fail on CI:
+    #   (1) the superbuild clones with --filter=tree:0 (no historical trees), and
+    #       even our global tree:0 -> blob:none relaxation is not enough on some
+    #       runner git versions, which refuse to fetch the base blob on demand
+    #       and die with "could not build fake ancestor" instead of falling back
+    #       to a straight apply;
+    #   (2) a stale build-cache checkout can leave the working tree on a drifted
+    #       `main` rather than the pinned commit, so the straight apply also
+    #       fails and 3-way is the only path.
+    #
+    # Fix (verified locally): pin to b25ffeabd15b (the exact base commit the two
+    # patches were generated against - `git am --3way` applies straight on it with
+    # rc=0) AND make fontconfig a FULL clone (drop the filter entirely) so the
+    # 3-way base blob is always present, whichever path git takes. fontconfig is
+    # a low-churn dependency; pinning it for reproducibility is the right call.
+    # mpv/ffmpeg still auto-track latest.
     ("packages/fontconfig.cmake",
      "    GIT_TAG main\n",
      "    GIT_TAG b25ffeabd15b\n",
+     1),
+    # Full clone for fontconfig (see comment above). This REPLACEMENTS entry runs
+    # BEFORE the global tree:0 -> blob:none loop, so fontconfig ends up with no
+    # filter (full history) while every other git package keeps the lean
+    # blob:none clone as a safety net.
+    ("packages/fontconfig.cmake",
+     "    GIT_CLONE_FLAGS \"--filter=tree:0\"\n",
+     "    GIT_CLONE_FLAGS \"\"\n",
      1),
     # ---------------- superbuild git machinery: allow pinned commit hashes ----------------
     # shinchiro's helper (cmake/custom_steps.cmake) writes a `reset_head.sh`
@@ -350,6 +370,14 @@ REPLACEMENTS = [
     ("cmake/custom_steps.cmake",
      "    git -C ${source_dir} reset --hard ${reset} -q\n",
      "    git -C ${source_dir} reset --hard ${reset} -q 2>/dev/null || git -C ${source_dir} reset --hard -q\n",
+     1),
+    # The force-update step hardcodes `git fetch --filter=tree:0`. If it ever
+    # runs (or a stale cache re-enters the flow), re-partializing the repo would
+    # again strip the 3-way base trees/blobs and re-trigger "could not build fake
+    # ancestor". Drop the filter so any fetch stays a normal full fetch.
+    ("cmake/custom_steps.cmake",
+     "git fetch --filter=tree:0 --no-recurse-submodules || true",
+     "git fetch --no-recurse-submodules || true",
      1),
     # ---------------- libvpl: let git am --3way fetch the 3-way base ----------------
     # libvpl tracks GIT_TAG main (a moving branch) and is patched with
@@ -419,6 +447,16 @@ REPLACEMENTS = [
     ("packages/curl.cmake",
      "    PATCH_COMMAND ${EXEC} git am --3way ${CMAKE_CURRENT_SOURCE_DIR}/curl-*.patch\n",
      "    PATCH_COMMAND ${EXEC} git am --3way ${CMAKE_CURRENT_SOURCE_DIR}/curl-*.patch && bash ${CMAKE_SOURCE_DIR}/fix_curl_schannel.sh <SOURCE_DIR>\n",
+     1),
+    # curl's PATCH_COMMAND also uses `git am --3way`. Give it a FULL clone too
+    # (same reason as fontconfig/libvpl): if a cached partial clone ever has to
+    # fall back to a 3-way merge, the base blobs MUST be present or git dies
+    # with "could not build fake ancestor". curl's history is modest, and the
+    # repo is cached afterwards. This REPLACEMENTS entry runs before the global
+    # tree:0 -> blob:none loop, so curl keeps the empty (full-clone) flags.
+    ("packages/curl.cmake",
+     "    GIT_CLONE_FLAGS \"--filter=tree:0\"\n",
+     "    GIT_CLONE_FLAGS \"\"\n",
      1),
     # ---------------- libarchive ----------------
     ("packages/libarchive.cmake",
@@ -551,19 +589,27 @@ def main() -> int:
     # Switching to --filter=blob:none keeps clones lean (blobs still fetched
     # on demand) while trees ARE present, so git am --3way can locate the base
     # and reconstruct the ancestor. This is a safety net for every git package
-    # that tracks a moving branch; libvpl above is switched to a full clone for
-    # an extra guarantee on the currently-failing package.
-    GLOBAL_FILTER_OLD = 'GIT_CLONE_FLAGS "--filter=tree:0"'
-    GLOBAL_FILTER_NEW = 'GIT_CLONE_FLAGS "--filter=blob:none"'
+    # that tracks a moving branch; libvpl and fontconfig above are switched to
+    # a FULL clone for an extra guarantee on the packages that have actually
+    # failed this way.
+    #
+    # NOTE: the real flag strings in the superbuild are often prefixed, e.g.
+    # "--sparse --filter=tree:0" or "--depth=1 --filter=tree:0". We therefore
+    # match the bare `--filter=tree:0` SUBSTRING (no surrounding quotes) and
+    # replace only that token, keeping any --sparse/--depth=1 prefix intact.
+    GLOBAL_FILTER_OLD = '--filter=tree:0'
+    GLOBAL_FILTER_NEW = '--filter=blob:none'
     for cmake_file in sorted(root.rglob("*.cmake")):
         try:
             t = cmake_file.read_text(encoding="utf-8")
         except (IsADirectoryError, UnicodeDecodeError, PermissionError):
             continue
         if GLOBAL_FILTER_OLD in t:
-            cmake_file.write_text(
-                t.replace(GLOBAL_FILTER_OLD, GLOBAL_FILTER_NEW), encoding="utf-8")
-            print(f"OK   [global] {cmake_file}: --filter=tree:0 -> blob:none")
+            new_t = t.replace(GLOBAL_FILTER_OLD, GLOBAL_FILTER_NEW)
+            cmake_file.write_text(new_t, encoding="utf-8")
+            n = t.count(GLOBAL_FILTER_OLD)
+            print(f"OK   [global] {cmake_file}: --filter=tree:0 -> blob:none"
+                  f" ({n} occurrence{'s' if n != 1 else ''})")
 
     # Write the option-drift tolerance + Schannel TLS 1.2/1.3 helper scripts
     # into the superbuild root (referenced by ffmpeg's / curl's PATCH_COMMAND

@@ -107,12 +107,32 @@ jobs:
           echo "cache base: i686-schannel-build-${SUPERBUILD_COMMIT}-${PH}"
 
       - name: Restore build cache
+        id: cache-restore
         uses: actions/cache/restore@v4
         with:
           path: mpv-winbuild
           key: i686-schannel-build-${{ env.SUPERBUILD_COMMIT }}-${{ env.PATCH_HASH }}
           restore-keys: |
             i686-schannel-build-${{ env.SUPERBUILD_COMMIT }}-
+
+      # `restore-keys` above allows a PREFIX match, so when the patch revision
+      # changes actions/cache falls back to a cache produced by a DIFFERENT
+      # patch. That tree contains src_packages git checkouts cloned with the OLD
+      # flags (--filter=tree:0) and stamps from the OLD patch commands. This is
+      # exactly what made `git am --3way` die with "could not build fake
+      # ancestor", and would also silently SKIP a newly added PATCH_COMMAND.
+      # Force the affected packages to be re-cloned / re-patched with the
+      # CURRENT patch, while keeping the expensive cross toolchain and all
+      # unrelated built artifacts from the cache.
+      - name: Invalidate stale git sources on a partial cache hit
+        if: steps.cache-restore.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          for p in fontconfig curl libvpl; do
+            rm -rf "mpv-winbuild/src_packages/$p" \
+                   "mpv-winbuild/build/packages/${p}-prefix"
+          done
+          echo "partial cache hit: invalidated fontconfig/curl/libvpl sources + stamps"
 
       - name: Clone / pin shinchiro superbuild
         run: |
